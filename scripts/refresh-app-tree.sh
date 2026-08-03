@@ -1,6 +1,7 @@
 #!/bin/bash
-SEARCH_DIR="/Users/telltale/Documents/software/Briefcase/dist-electron/mac-arm64/Briefcase.app"
-TARGET_FILE="/Users/telltale/Documents/software/Briefcase/docs/completed_app_structure.md"
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SEARCH_DIR="$PROJECT_ROOT/dist-electron/mac-arm64/Briefcase.app"
+TARGET_FILE="$PROJECT_ROOT/docs/completed_app_structure.md"
 
 echo "Refreshing tree in: $TARGET_FILE"
 
