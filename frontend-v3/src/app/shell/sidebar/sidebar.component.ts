@@ -27,6 +27,12 @@ export class SidebarComponent {
 
   selectSection = output<'library' | 'queue' | 'collections' | 'settings' | 'archives'>();
   selectCollection = output<string>();
+  collectionContextMenu = output<{ collection: VideoTab; x: number; y: number }>();
   newCollection = output<void>();
   openLibrarySwitcher = output<void>();
+
+  onCollectionContextMenu(collection: VideoTab, event: MouseEvent): void {
+    event.preventDefault();
+    this.collectionContextMenu.emit({ collection, x: event.clientX, y: event.clientY });
+  }
 }

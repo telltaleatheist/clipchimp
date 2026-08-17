@@ -38,7 +38,8 @@
       type="button"
       class="nav-item collection"
       [class.active]="activeSection() === 'collections' && activeCollectionId() === collection.id"
-      (click)="selectCollection.emit(collection.id)">
+      (click)="selectCollection.emit(collection.id)"
+      (contextmenu)="onCollectionContextMenu(collection, $event)">
       <span class="glyph">⬩</span>
       <span class="label">{{ collection.name }}</span>
       @if (collection.video_count) {

@@ -41,6 +41,7 @@
       [currentLibraryName]="currentLibraryName()"
       (selectSection)="onSelectSection($event)"
       (selectCollection)="onSelectCollection($event)"
+      (collectionContextMenu)="onCollectionContextMenu($event)"
       (newCollection)="onNewCollection()"
       (openLibrarySwitcher)="onOpenLibrarySwitcher()" />
 
@@ -65,4 +66,17 @@
       <app-inspector-panel [aiReady]="aiReady()" [aiCheckFailed]="aiCheckFailed()" [collections]="collections()" />
     </div>
   }
+
+  <app-context-menu
+    [visible]="collectionMenuVisible()"
+    [position]="collectionMenuPosition()"
+    [actions]="collectionMenuActions"
+    (actionSelected)="onCollectionMenuAction($event)"
+    (closed)="collectionMenuVisible.set(false)" />
+
+  <app-new-tab-dialog
+    [show]="newCollectionDialogOpen()"
+    mode="create"
+    (created)="onCollectionCreated($event)"
+    (closed)="newCollectionDialogOpen.set(false)" />
 </div>

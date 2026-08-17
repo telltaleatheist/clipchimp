@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { Router, RouterOutlet } from '@angular/router';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { NavigationStore, ShellSection } from '../core/stores/navigation.store';
@@ -8,7 +8,7 @@ import { SystemEventsService } from '../core/stores/system-events.service';
 import { AiSetupService } from '../services/ai-setup.service';
 import { LibraryService } from '../services/library.service';
 import { QueueService } from '../services/queue.service';
-import { TabsService } from '../services/tabs.service';
+import { TabsService, VideoTab } from '../services/tabs.service';
 import { ThemeService } from '../services/theme.service';
 import { TourService } from '../services/tour.service';
 import { LoggerService } from '../services/logger.service';
@@ -17,6 +17,9 @@ import { ToolbarComponent } from './toolbar/toolbar.component';
 import { ToolbarActionsComponent } from './toolbar/toolbar-actions.component';
 import { InspectorPanelComponent } from './inspector/inspector-panel.component';
 import { InspectorResizeDirective } from './inspector/inspector-resize.directive';
+import { ContextMenuComponent } from '../components/context-menu/context-menu.component';
+import { NewTabDialogComponent } from '../components/new-tab-dialog/new-tab-dialog.component';
+import { ContextMenuAction, ContextMenuPosition } from '../models/file.model';
 
 const SECTION_TITLES: Record<ShellSection, string> = {
   library: 'Library',
@@ -38,7 +41,7 @@ const SECTION_TITLES: Record<ShellSection, string> = {
 @Component({
   selector: 'app-shell',
   standalone: true,
-  imports: [RouterOutlet, SidebarComponent, ToolbarComponent, ToolbarActionsComponent, InspectorPanelComponent, InspectorResizeDirective],
+  imports: [RouterOutlet, SidebarComponent, ToolbarComponent, ToolbarActionsComponent, InspectorPanelComponent, InspectorResizeDirective, ContextMenuComponent, NewTabDialogComponent],
   templateUrl: './app-shell.component.html',
   styleUrls: ['./app-shell.component.scss'],
   changeDetection: ChangeDetectionStrategy.OnPush
@@ -116,9 +119,53 @@ export class AppShellComponent {
     this.nav.goToCollection(id);
   }
 
+  // ── Collection right-click menu ───────────────────────────────────────
+  collectionMenuVisible = signal(false);
+  collectionMenuPosition = signal<ContextMenuPosition>({ x: 0, y: 0 });
+  private collectionMenuTarget = signal<VideoTab | null>(null);
+  collectionMenuActions: ContextMenuAction[] = [
+    { label: 'Delete Collection', icon: '🗑️', action: 'delete' }
+  ];
+
+  onCollectionContextMenu(payload: { collection: VideoTab; x: number; y: number }): void {
+    this.collectionMenuTarget.set(payload.collection);
+    this.collectionMenuPosition.set({ x: payload.x, y: payload.y });
+    this.collectionMenuVisible.set(true);
+  }
+
+  onCollectionMenuAction(action: string): void {
+    const target = this.collectionMenuTarget();
+    this.collectionMenuVisible.set(false);
+    if (action === 'delete' && target) {
+      this.deleteCollection(target);
+    }
+  }
+
+  private deleteCollection(collection: VideoTab): void {
+    if (!confirm(`Delete the collection "${collection.name}"? This won't delete the videos in it.`)) {
+      return;
+    }
+    this.tabsService.deleteTab(collection.id).subscribe({
+      error: (err) => console.error('Failed to delete collection:', err)
+    });
+    // If we were viewing the collection we just deleted, leave its (now empty) view.
+    if (this.nav.activeCollectionId() === collection.id) {
+      this.nav.goTo('library');
+    }
+  }
+
+  // ── New collection naming dialog ──────────────────────────────────────
+  newCollectionDialogOpen = signal(false);
+
   onNewCollection(): void {
-    // Phase 1: the collections view owns creation; just take the user there.
-    this.nav.goTo('collections');
+    this.newCollectionDialogOpen.set(true);
+  }
+
+  onCollectionCreated(name: string): void {
+    this.newCollectionDialogOpen.set(false);
+    this.tabsService.createTab(name).subscribe({
+      error: (err) => console.error('Failed to create collection:', err)
+    });
   }
 
   onOpenLibrarySwitcher(): void {
