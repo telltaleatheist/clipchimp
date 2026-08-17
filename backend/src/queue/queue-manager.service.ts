@@ -1,7 +1,7 @@
 // Queue Manager Service - Executes task-based jobs with configurable concurrency
 
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { EventEmitter2 } from '@nestjs/event-emitter';
+import { EventEmitter2, OnEvent } from '@nestjs/event-emitter';
 import { MediaEventService } from '../media/media-event.service';
 import { MediaOperationsService } from '../media/media-operations.service';
 import { LibraryManagerService } from '../database/library-manager.service';
@@ -62,7 +62,13 @@ export class QueueManagerService implements OnModuleDestroy, OnModuleInit {
   private watchdogInterval: NodeJS.Timeout | null = null;
   private readonly WATCHDOG_INTERVAL_MS = 60000;  // Check every minute
   private readonly AI_TASK_TIMEOUT_MS = 30 * 60 * 1000;  // 30 minutes for AI tasks
-  private readonly MAIN_TASK_TIMEOUT_MS = 10 * 60 * 1000;  // 10 minutes for other tasks
+  // Main-pool tasks are killed on a STALL, not on total runtime. A wall-clock
+  // cap can't distinguish a wedged task from a healthy slow one, and legitimate
+  // work routinely runs past any cap worth setting: a 2.5-hour broadcast is a
+  // multi-GB HLS download, and transcode/transcribe scale with duration too.
+  // As long as a task keeps reporting progress it is making headway and is left
+  // alone; 10 minutes of total silence is the stuck signal.
+  private readonly MAIN_TASK_STALL_MS = 10 * 60 * 1000;  // 10 minutes with no progress
 
   // Concurrency limits (5+1 model)
   private readonly MAX_MAIN_CONCURRENT = 5;  // 5 general tasks
@@ -137,13 +143,13 @@ export class QueueManagerService implements OnModuleDestroy, OnModuleInit {
       const runningMs = now.getTime() - task.startedAt.getTime();
       const lastProgressMs = now.getTime() - task.lastProgressAt.getTime();
 
-      if (runningMs > this.MAIN_TASK_TIMEOUT_MS) {
+      if (lastProgressMs > this.MAIN_TASK_STALL_MS) {
         this.logger.error(
-          `⏱️ Main task ${taskId} (${task.type}) exceeded the ${Math.round(this.MAIN_TASK_TIMEOUT_MS / 60000)}-minute timeout ` +
-          `(running ${Math.round(runningMs / 60000)}m, last progress ${Math.round(lastProgressMs / 1000)}s ago at ${task.progress}%). ` +
+          `⏱️ Main task ${taskId} (${task.type}) stalled: no progress for ` +
+          `${Math.round(lastProgressMs / 60000)}m (running ${Math.round(runningMs / 60000)}m, stuck at ${task.progress}%). ` +
           `Failing it and freeing the slot.`
         );
-        this.failStuckTask(task, 'main', `Task timed out after ${Math.round(runningMs / 60000)} minutes without completing`);
+        this.failStuckTask(task, 'main', `Task stalled — no progress for ${Math.round(lastProgressMs / 60000)} minutes`);
       }
     }
   }
@@ -242,6 +248,20 @@ export class QueueManagerService implements OnModuleDestroy, OnModuleInit {
 
     this.eventService.emit('task.failed', event);
     this.eventEmitter.emit('task.failed', event);
+  }
+
+  /**
+   * Heartbeat from the services that own long-running child processes
+   * (download, transcode, transcribe). MediaEventService mirrors every
+   * 'task-progress' it emits onto this bus. Without it the watchdog only ever
+   * saw a task's starting progress and reaped healthy long work as stalled.
+   */
+  @OnEvent('task.progress')
+  handleTaskProgress(payload: { jobId?: string; progress?: number; message?: string }): void {
+    if (!payload?.jobId || typeof payload.progress !== 'number') {
+      return;
+    }
+    this.updateTaskProgress(payload.jobId, payload.progress, payload.message);
   }
 
   /**

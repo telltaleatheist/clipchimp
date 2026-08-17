@@ -1,5 +1,6 @@
 // Briefcase/backend/src/media/media-event.service.ts
 import { Injectable, Logger } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { WebSocketService } from '../common/websocket.service';
 
 /**
@@ -32,13 +33,27 @@ export interface ProgressTimeOptions {
 export class MediaEventService {
   private readonly logger = new Logger(MediaEventService.name);
 
-  constructor(private readonly websocketService: WebSocketService) {}
+  constructor(
+    private readonly websocketService: WebSocketService,
+    private readonly eventEmitter: EventEmitter2,
+  ) {}
 
   /**
    * Base method to emit any event with data
    * Uses WebSocketService to access the shared Socket.IO server
+   *
+   * 'task-progress' is additionally mirrored onto EventEmitter2 as
+   * 'task.progress'. Socket.IO only reaches the renderer, but the queue
+   * watchdog lives in-process and needs the same heartbeat to tell a working
+   * long task from a wedged one — without it every download/transcode looked
+   * frozen at its starting progress. Mirroring here (rather than at each
+   * call site) covers download, transcription and processing in one place.
    */
   public emitEvent(eventType: string, data: any): void {
+    if (eventType === 'task-progress') {
+      this.eventEmitter.emit('task.progress', data);
+    }
+
     const server = this.websocketService.getServer();
 
     if (!server) {
