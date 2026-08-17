@@ -222,15 +222,20 @@ export class YtDlpBridge extends EventEmitter {
       let stderrBuffer = '';
       let stdoutLineBuffer = '';
 
-      // Process stdout for progress. Carry the partial trailing line across
-      // chunks so a progress line split mid-buffer isn't parsed (and dropped)
-      // as two broken halves.
+      // Process stdout for progress. yt-dlp terminates progress records with a
+      // bare \r (so they overwrite in place on a TTY) and only uses \n for
+      // status lines. Splitting on \n alone therefore never yields a single
+      // progress record: the whole download's progress piles up in the partial
+      // -line buffer and is dropped, leaving the queue watchdog convinced the
+      // task is stuck at 0%. Split on \r and \n both. Carry the partial
+      // trailing line across chunks so a record split mid-buffer isn't parsed
+      // (and dropped) as two broken halves.
       proc.stdout?.on('data', (data: Buffer) => {
         const chunk = data.toString();
         stdoutBuffer += chunk;
 
         stdoutLineBuffer += chunk;
-        const lines = stdoutLineBuffer.split('\n');
+        const lines = stdoutLineBuffer.split(/\r\n|[\r\n]/);
         stdoutLineBuffer = lines.pop() ?? '';
         for (const line of lines) {
           if (line.trim()) {
