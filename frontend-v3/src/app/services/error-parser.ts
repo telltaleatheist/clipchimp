@@ -43,6 +43,15 @@ export class ErrorParser {
           title = 'Invalid AI Model';
           message = `The AI model "${modelName}" is not available.\n\nThis usually means:\n• The model name is misspelled\n• The model has been deprecated\n• You need to update to a newer model version\n\nPlease check your Settings and select a valid model.`;
         }
+      } else if (error.includes('THREADS_NO_VIDEO:')) {
+        // Named by backend/src/downloader/threads-extractor.ts. Checked ahead of the
+        // generic status-code cases below so a Threads message can't be swallowed
+        // by a stray number in the post code or caption.
+        title = 'No Video in This Post';
+        message = 'This Threads post doesn\'t contain a video — it\'s an image or text-only post.\n\nOnly Threads posts with video can be downloaded.';
+      } else if (error.includes('THREADS_POST_UNAVAILABLE:')) {
+        title = 'Threads Post Unavailable';
+        message = 'Threads didn\'t return this post.\n\nThis usually means:\n• The post was deleted\n• The account is private\n• The post is age-restricted\n\nCheck the link in a browser while logged out to confirm it\'s publicly visible.';
       } else if (error.includes('404') && !error.includes('model:')) {
         title = 'Resource Not Found';
         message = 'The requested resource could not be found.';

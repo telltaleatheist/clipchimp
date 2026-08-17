@@ -12,6 +12,12 @@ import { MediaEventService } from '../media/media-event.service';
 import { FilenameDateUtil } from '../common/utils/filename-date.util';
 import { UniquePathUtil } from '../common/utils/unique-path.util';
 import { DatabaseService } from '../database/database.service';
+import {
+  ThreadsMedia,
+  THREADS_CRAWLER_USER_AGENT,
+  extractThreadsMedia,
+  parseThreadsPostUrl,
+} from './threads-extractor';
 
 @Injectable()
 export class DownloaderService implements OnModuleInit {
@@ -209,8 +215,17 @@ export class DownloaderService implements OnModuleInit {
 
   /**
    * Fetch a page's HTML content, following redirects (up to 5 hops).
+   *
+   * headerOverrides is merged over the default browser headers and CARRIED
+   * ACROSS redirect hops — threads.net 301-redirects to threads.com, and a
+   * Threads fetch that lost its crawler User-Agent on the hop would land on the
+   * empty JavaScript shell instead of the server-rendered post.
    */
-  private async fetchPageContent(url: string, maxRedirects = 5): Promise<string> {
+  private async fetchPageContent(
+    url: string,
+    maxRedirects = 5,
+    headerOverrides?: Record<string, string>,
+  ): Promise<string> {
     const httpModule = url.startsWith('https') ? require('https') : require('http');
 
     return new Promise((resolve, reject) => {
@@ -218,6 +233,7 @@ export class DownloaderService implements OnModuleInit {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
+        ...headerOverrides,
       } }, (response: any) => {
         // Follow redirects
         if ((response.statusCode === 301 || response.statusCode === 302 || response.statusCode === 303) && response.headers.location) {
@@ -225,7 +241,7 @@ export class DownloaderService implements OnModuleInit {
             reject(new Error('Too many redirects'));
             return;
           }
-          this.fetchPageContent(response.headers.location, maxRedirects - 1)
+          this.fetchPageContent(response.headers.location, maxRedirects - 1, headerOverrides)
             .then(resolve)
             .catch(reject);
           return;
@@ -442,7 +458,11 @@ export class DownloaderService implements OnModuleInit {
       // dedup lookup, download and history all key off the same (player) URL — a
       // documented limitation, but consistent for a given page since detection is
       // now deterministic.
-      if (!options.url.includes('vimeo.com')) {
+      // Threads is excluded outright: its own handler owns the URL, and a Threads
+      // post carrying a Vimeo link preview would otherwise have options.url
+      // REPLACED by the embed here, breaking the Threads download entirely. It
+      // also saves a pointless fetch of the empty JS shell before every one.
+      if (!options.url.includes('vimeo.com') && !parseThreadsPostUrl(options.url)) {
         try {
           const embedInfo = await this.extractPrimaryVimeoEmbedUrl(options.url);
           if (embedInfo) {
@@ -526,6 +546,18 @@ export class DownloaderService implements OnModuleInit {
         throw new Error(error);
       }
       
+      // Threads has no yt-dlp extractor, so this is not a fast path with a
+      // fallback behind it — it is the only route, and its errors are final.
+      // The page is re-scraped here (getVideoInfo already read it for metadata)
+      // because the CDN URL is signed with short-lived oh=/oe= params and must be
+      // fetched immediately before the transfer.
+      const threadsPost = parseThreadsPostUrl(options.url);
+      if (threadsPost) {
+        this.logger.log(`Detected Threads post URL: @${threadsPost.username}/${threadsPost.code}`);
+        const media = await this.fetchThreadsMedia(options.url, threadsPost.code);
+        return await this.downloadThreadsVideo(options.url, media, downloadFolder, uploadDate, jobId);
+      }
+
       // Check if this is a Reddit URL - try direct download first (avoids rate-limited API)
       // Includes retry with delay to handle Reddit's aggressive rate-limiting
       if (options.url.includes('reddit.com')) {
@@ -2360,6 +2392,190 @@ export class DownloaderService implements OnModuleInit {
   }
 
   /**
+   * Scrape a Threads post for its video, caption, date and thumbnail.
+   *
+   * yt-dlp has no Threads extractor at all, so there is nothing to fall back to:
+   * a failure here is the whole download's failure and the named errors from
+   * threads-extractor are propagated unchanged.
+   */
+  private async fetchThreadsMedia(pageUrl: string, code: string): Promise<ThreadsMedia> {
+    // Threads answers a browser User-Agent with an empty JavaScript shell — no
+    // Open Graph tags, no media URLs — and server-renders the post JSON only for
+    // crawler user-agents. This is the whole reason the scrape works.
+    const html = await this.fetchPageContent(pageUrl, 5, { 'User-Agent': THREADS_CRAWLER_USER_AGENT });
+    const media = extractThreadsMedia(html, code);
+    this.logger.log(`Threads: post ${code} → "${media.title}" (${media.uploadDate || 'no upload date'})`);
+    return media;
+  }
+
+  /**
+   * Download a Threads post's mp4 directly over HTTPS.
+   *
+   * The CDN URL is signed with expiring oh=/oe= query params, so it is extracted
+   * immediately before this call and is never cached or persisted as a reusable
+   * link — a stored Threads URL would 403 by the time it was replayed.
+   */
+  private async downloadThreadsVideo(
+    pageUrl: string,
+    media: ThreadsMedia,
+    downloadFolder: string,
+    uploadDate: string | undefined,
+    jobId?: string,
+  ): Promise<DownloadResult> {
+    const https = require('https');
+
+    // Bail out early if the job was already cancelled.
+    if (this.isDownloadCancelled(jobId)) {
+      throw new Error('Download was cancelled');
+    }
+
+    const effectiveDate = uploadDate || media.uploadDate;
+    const sanitizedTitle = FilenameDateUtil.sanitizeFilename(media.title);
+    const filename = FilenameDateUtil.ensureDatePrefix(sanitizedTitle + '.mp4', effectiveDate);
+    // Never overwrite a DIFFERENT video already saved with the same date + title (Bug 4).
+    const outputFile = UniquePathUtil.resolveUniquePath(path.join(downloadFolder, filename));
+
+    const headers = {
+      // The Instagram CDN wants an ordinary browser here — the crawler UA is only
+      // for the Threads page itself — plus a Threads referer, or it answers 403.
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Accept': '*/*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.threads.com/',
+    };
+
+    const downloadFile = (fileUrl: string, dest: string, retryCount = 0): Promise<void> => {
+      return new Promise((resolve, reject) => {
+        const file = fs.createWriteStream(dest);
+        const cleanup = () => {
+          file.close();
+          try { if (fs.existsSync(dest)) fs.unlinkSync(dest); } catch {}
+        };
+
+        const request = https.get(fileUrl, { headers }, (res: any) => {
+          if (res.statusCode === 301 || res.statusCode === 302) {
+            cleanup();
+            res.resume(); // drain the redirect body so the socket frees
+            const redirectUrl = res.headers.location;
+            if (!redirectUrl) {
+              reject(new Error('Threads CDN redirected without a location header'));
+              return;
+            }
+            downloadFile(redirectUrl, dest, retryCount).then(resolve).catch(reject);
+            return;
+          }
+
+          // Retry on rate-limit (429) or server error (5xx) with backoff
+          if ((res.statusCode === 429 || res.statusCode >= 500) && retryCount < 2) {
+            cleanup();
+            res.resume();
+            const delay = (retryCount + 1) * 2000;
+            this.logger.warn(`Threads CDN returned ${res.statusCode}, retrying in ${delay}ms`);
+            setTimeout(() => {
+              downloadFile(fileUrl, dest, retryCount + 1).then(resolve).catch(reject);
+            }, delay);
+            return;
+          }
+
+          if (res.statusCode !== 200) {
+            cleanup();
+            res.resume(); // drain the undelivered body so the socket can be reused/freed
+            reject(new Error(
+              `Threads CDN returned HTTP ${res.statusCode} for the post's video. The signed media URL `
+              + 'may have expired — try the download again.',
+            ));
+            return;
+          }
+
+          const totalBytes = parseInt(res.headers['content-length'] || '0', 10);
+          let receivedBytes = 0;
+          let lastPercent = -1;
+
+          res.pipe(file);
+
+          // pipe() does NOT forward source errors, and destroying the request on
+          // cancel makes the response emit one — without this listener that would
+          // surface as an uncaught 'error' event and take the process down.
+          res.on('error', (err: any) => {
+            cleanup();
+            reject(err);
+          });
+
+          res.on('data', (chunk: any) => {
+            // A single large GET, so cancellation is checked per chunk and aborts
+            // the in-flight request rather than waiting for the transfer to end.
+            if (this.isDownloadCancelled(jobId)) {
+              request.destroy();
+              cleanup();
+              reject(new Error('Download was cancelled'));
+              return;
+            }
+
+            receivedBytes += chunk.length;
+            if (jobId && totalBytes > 0) {
+              const percent = Math.min(99, Math.floor((receivedBytes / totalBytes) * 100));
+              if (percent !== lastPercent) {
+                lastPercent = percent;
+                this.eventService.emitDownloadProgress(percent, 'Downloading Threads video...', jobId, {});
+              }
+            }
+          });
+
+          file.on('finish', () => {
+            // A connection dropped mid-transfer can still end the write stream, so
+            // a short file is rejected rather than imported as a truncated video.
+            if (totalBytes > 0 && receivedBytes < totalBytes) {
+              cleanup();
+              reject(new Error(
+                `Threads download was truncated: received ${receivedBytes} of ${totalBytes} bytes`,
+              ));
+              return;
+            }
+            file.close();
+            resolve();
+          });
+          file.on('error', (err: any) => { cleanup(); reject(err); });
+        });
+
+        request.on('error', (err: any) => {
+          cleanup();
+          reject(err);
+        });
+      });
+    };
+
+    if (jobId) {
+      this.eventService.emitDownloadProgress(0, 'Downloading Threads video...', jobId, {});
+    }
+
+    try {
+      await downloadFile(media.videoUrl, outputFile);
+    } catch (err) {
+      try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch {}
+      throw err;
+    }
+
+    if (!fs.existsSync(outputFile) || fs.statSync(outputFile).size === 0) {
+      try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch {}
+      throw new Error(`Threads download finished but wrote no data: ${outputFile}`);
+    }
+
+    this.logger.log(`Threads download succeeded: ${outputFile}`);
+    if (jobId) {
+      this.eventService.emitDownloadProgress(100, 'Threads download complete', jobId, {});
+    }
+
+    const processedFile = await this.processOutputFilename(outputFile, effectiveDate);
+    this.addToHistory(processedFile, pageUrl);
+    this.eventService.emitDownloadCompleted(processedFile, pageUrl, jobId, false);
+    if (jobId) {
+      this.activeDownloads.delete(jobId);
+    }
+
+    return { success: true, outputFile: processedFile };
+  }
+
+  /**
    * Process output filename to ensure consistent date format
    * Uses FilenameDateUtil to enforce YYYY-MM-DD [title] format
    */
@@ -2519,6 +2735,26 @@ export class DownloaderService implements OnModuleInit {
           formats: [],
           width: 0,
           height: 0,
+        };
+      }
+
+      // Threads posts are scraped, not shelled out to yt-dlp: yt-dlp has no
+      // Threads extractor, so the yt-dlp call could only fail with "Unsupported
+      // URL" and cost the caller a spurious "Upload date unavailable" warning.
+      const threadsPost = parseThreadsPostUrl(url);
+      if (threadsPost) {
+        const media = await this.fetchThreadsMedia(url, threadsPost.code);
+        return {
+          title: media.title,
+          uploader: `@${threadsPost.username}`,
+          duration: 0,
+          thumbnail: media.thumbnailUrl || '',
+          uploadDate: media.uploadDate,
+          description: '',
+          formats: [],
+          width: 0,
+          height: 0,
+          isLive: false,
         };
       }
 
