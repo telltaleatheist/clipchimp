@@ -295,7 +295,14 @@ export class ExportDialogComponent implements OnInit, OnDestroy {
       return {
         weekLabel: `${icon} ${category}`,
         videos,
-        expanded: category === 'Export Changes' || category === 'Current Selection' // Expand special categories by default
+        // Every category starts expanded. This dialog is a picker, so a collapsed
+        // category hides the very markers the user opened it to choose — and with
+        // the "no sections" message gated on sections.length (never 0, since
+        // __full_video__ is always pushed), a collapsed list reads as "I have no
+        // markers" rather than "your markers are one click away". The collapsed
+        // default was inert until the cascade began honouring this hint (e7d4fa8);
+        // before that it forced every week open.
+        expanded: true
       };
     });
 

@@ -499,9 +499,6 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
   isSelecting = signal(false);
   selectionStart = signal<number | null>(null);
 
-  // Custom markers created by user
-  customMarkers = signal<CustomMarker[]>([]);
-
   // Mute sections for audio censoring
   muteSections = signal<MuteSection[]>([]);
   selectedMuteSection = signal<MuteSection | undefined>(undefined);
@@ -2094,8 +2091,13 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
       console.warn('videoPath is null, export dialog may need to fetch it');
     }
 
-    // Prepare AI analysis sections for export
-    const aiSections = this.filteredSections().map(section => ({
+    // Custom markers are NOT a second list to merge in. A saved marker is a
+    // custom_markers row, and GET /videos/:id/sections returns those alongside
+    // the AI sections, so markers are already in filteredSections() with their
+    // own category. The customMarkers signal this used to merge was never
+    // written to, so it contributed an empty array and made the marker path look
+    // like it lived somewhere it doesn't.
+    const sections = this.filteredSections().map(section => ({
       id: section.id,
       category: section.category,
       description: section.description,
@@ -2103,21 +2105,6 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
       endSeconds: section.endTime,
       timeRange: `${this.formatTime(section.startTime)} - ${this.formatTime(section.endTime)}`
     }));
-
-    // Include custom markers as exportable sections
-    const customMarkerSections = this.customMarkers()
-      .filter(marker => marker.endTime !== undefined && marker.endTime > marker.startTime)
-      .map(marker => ({
-        id: marker.id,
-        category: marker.category || 'Marker',
-        description: marker.message,
-        startSeconds: marker.startTime,
-        endSeconds: marker.endTime!,
-        timeRange: `${this.formatTime(marker.startTime)} - ${this.formatTime(marker.endTime!)}`
-      }));
-
-    // Combine AI sections and custom markers
-    const sections = [...aiSections, ...customMarkerSections];
 
     // Get current selection if any
     const selection = this.highlightSelection();
