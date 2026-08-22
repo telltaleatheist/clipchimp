@@ -124,17 +124,13 @@ export class ModelManagerService implements OnModuleInit {
     // Use GPU VRAM for recommendations if available, otherwise fall back to system RAM
     const effectiveMemoryGB = useGpu && gpu ? gpu.vramGB : totalMemoryGB;
 
-    // Recommend model based on effective memory (GPU VRAM or system RAM)
-    let recommendedModel: string;
-    if (effectiveMemoryGB >= 24) {
-      recommendedModel = 'cogito-32b';
-    } else if (effectiveMemoryGB >= 10) {
-      recommendedModel = 'cogito-14b';
-    } else if (effectiveMemoryGB >= 6) {
-      recommendedModel = 'cogito-8b';
-    } else {
-      recommendedModel = 'cogito-3b';
-    }
+    // Recommend the largest catalog model that fits in effective memory (GPU
+    // VRAM or system RAM). COGITO_MODELS is currently empty — Briefcase ships no
+    // bundled GGUFs — so this yields '' and callers show no local recommendation.
+    const recommendedModel =
+      [...COGITO_MODELS]
+        .sort((a, b) => b.minRAM - a.minRAM)
+        .find((m) => effectiveMemoryGB >= m.minRAM)?.id ?? '';
 
     return {
       totalMemoryGB,

@@ -92,11 +92,11 @@ type Step = 'welcome' | 'tools' | 'models' | 'ai' | 'review' | 'finishing';
             @case ('ai') {
               <div class="step-head">
                 <h3>AI for video analysis</h3>
-                <p class="sub">Briefcase runs AI locally on your machine by default — private, offline, and free. Pick a Cogito model to download (it runs through llama.cpp). Prefer a cloud provider? Add a key below.</p>
+                <p class="sub">Briefcase can analyse video with a local model through <a class="linklike" href="#" (click)="open('https://ollama.com'); $event.preventDefault()">Ollama</a> — private, offline, and free — or with Claude or OpenAI. Install Ollama and pull a model, or add a cloud API key below.</p>
               </div>
 
-              <div class="group-label">Local models — recommended</div>
               @if (llamaModels().length) {
+                <div class="group-label">Local models — recommended</div>
                 <div class="select-list">
                   @for (c of llamaModels(); track c.id) {
                     <label class="select-card"
@@ -118,7 +118,8 @@ type Step = 'welcome' | 'tools' | 'models' | 'ai' | 'review' | 'finishing';
                 </div>
                 <p class="hint">Not sure? {{ recommendedName() }} is the best fit for this computer. The local AI engine (≈5 MB) installs automatically with your first model.</p>
               } @else {
-                <p class="sub">No local models are available for this platform.</p>
+                <div class="group-label">Local models</div>
+                <p class="sub">Briefcase no longer bundles its own local models. For offline analysis, install <a class="linklike" href="#" (click)="open('https://ollama.com'); $event.preventDefault()">Ollama</a> and pull a model (<code>ollama pull qwen3.8:27b</code>) — Briefcase picks it up automatically.</p>
               }
 
               <div class="group-label">Or use a cloud provider</div>
@@ -310,7 +311,11 @@ export class SetupWizardComponent implements OnInit {
 
   readonly recommendedName = computed(() => {
     const id = this.system()?.recommendedModel;
-    return this.llamaModels().find((m) => m.id === id)?.name || 'Cogito 8B';
+    // Only rendered inside the @if (llamaModels().length) branch, so the first
+    // entry is a real fallback rather than a name for a model that isn't offered.
+    return this.llamaModels().find((m) => m.id === id)?.name
+      ?? this.llamaModels()[0]?.name
+      ?? '';
   });
 
   async ngOnInit() {

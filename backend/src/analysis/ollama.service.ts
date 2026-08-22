@@ -189,19 +189,19 @@ Current model status: Not installed
   getRecommendedModels(): Array<{ name: string; size: string; description: string }> {
     return [
       {
-        name: 'llama3.2:3b',
-        size: '~2 GB',
-        description: 'Fast, lightweight model - good for most users',
+        name: 'qwen3.5:4b',
+        size: '~3.4 GB',
+        description: 'Fast and lightweight - for modest GPUs or CPU-only machines',
       },
       {
-        name: 'qwen2.5:7b',
-        size: '~4 GB',
+        name: 'qwen3.5:9b',
+        size: '~6.6 GB',
         description: 'Balanced performance and quality',
       },
       {
-        name: 'cogito:70b',
-        size: '~40 GB',
-        description: 'Best quality, requires significant RAM',
+        name: 'qwen3.8:27b',
+        size: '~18 GB',
+        description: 'Recommended default. Best quality that still fits 24GB+ of VRAM or unified memory',
       },
     ];
   }

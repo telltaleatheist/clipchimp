@@ -1,9 +1,9 @@
 /**
- * Self-contained model catalogs (whisper + local AI / Cogito).
+ * Self-contained model catalogs (whisper + local AI / GGUF).
  *
- * Both download directly from Hugging Face at runtime, independent of the
+ * These download directly from Hugging Face at runtime, independent of the
  * GitHub binaries manifest. This is the single source of truth shared by:
- *   - ModelManagerService (Cogito GGUF management for the analysis pipeline)
+ *   - ModelManagerService (local GGUF management for the analysis pipeline)
  *   - ComponentManagerService (download-on-demand for the setup wizard / dock)
  *
  * Keeping the catalog here (not in the published manifest) means new sizes can
@@ -13,9 +13,8 @@
 import { ComponentArtifact, ManifestComponent } from '../components/component.types';
 
 const HF_WHISPER = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main';
-const HF_BARTOWSKI = 'https://huggingface.co/bartowski';
 
-// ---------------- Local AI (Cogito) ----------------
+// ---------------- Local AI (llama.cpp GGUF) ----------------
 
 export interface CogitoModelDef {
   id: string;
@@ -30,59 +29,17 @@ export interface CogitoModelDef {
   description: string;
 }
 
-// Using bartowski's Q4_K_M quantizations from Hugging Face.
-export const COGITO_MODELS: CogitoModelDef[] = [
-  {
-    id: 'cogito-3b',
-    name: 'Cogito 3B',
-    filename: 'deepcogito_cogito-v1-preview-llama-3B-Q4_K_M.gguf',
-    url: `${HF_BARTOWSKI}/deepcogito_cogito-v1-preview-llama-3B-GGUF/resolve/main/deepcogito_cogito-v1-preview-llama-3B-Q4_K_M.gguf`,
-    sizeGB: 2.24,
-    minRAM: 4,
-    layers: 28,
-    description: 'Lightweight and fast. Works on most GPUs (4GB+ VRAM) or CPU.',
-  },
-  {
-    id: 'cogito-8b',
-    name: 'Cogito 8B',
-    filename: 'deepcogito_cogito-v1-preview-llama-8B-Q4_K_M.gguf',
-    url: `${HF_BARTOWSKI}/deepcogito_cogito-v1-preview-llama-8B-GGUF/resolve/main/deepcogito_cogito-v1-preview-llama-8B-Q4_K_M.gguf`,
-    sizeGB: 4.92,
-    minRAM: 6,
-    layers: 32,
-    description: 'Good balance of quality and speed. Runs great on 6GB+ GPU.',
-  },
-  {
-    id: 'cogito-14b',
-    name: 'Cogito 14B',
-    filename: 'deepcogito_cogito-v1-preview-qwen-14B-Q4_K_M.gguf',
-    url: `${HF_BARTOWSKI}/deepcogito_cogito-v1-preview-qwen-14B-GGUF/resolve/main/deepcogito_cogito-v1-preview-qwen-14B-Q4_K_M.gguf`,
-    sizeGB: 8.99,
-    minRAM: 10,
-    layers: 48,
-    description: 'Higher quality results. Runs on 10GB+ GPU or 16GB+ RAM.',
-  },
-  {
-    id: 'cogito-32b',
-    name: 'Cogito 32B',
-    filename: 'deepcogito_cogito-v1-preview-qwen-32B-Q4_K_M.gguf',
-    url: `${HF_BARTOWSKI}/deepcogito_cogito-v1-preview-qwen-32B-GGUF/resolve/main/deepcogito_cogito-v1-preview-qwen-32B-Q4_K_M.gguf`,
-    sizeGB: 19.85,
-    minRAM: 24,
-    layers: 64,
-    description: 'Best quality. Needs 24GB+ GPU or a Mac with 32GB+ unified memory.',
-  },
-  {
-    id: 'cogito-70b',
-    name: 'Cogito 70B',
-    filename: 'deepcogito_cogito-v1-preview-llama-70B-Q4_K_M.gguf',
-    url: `${HF_BARTOWSKI}/deepcogito_cogito-v1-preview-llama-70B-GGUF/resolve/main/deepcogito_cogito-v1-preview-llama-70B-Q4_K_M.gguf`,
-    sizeGB: 42.52,
-    minRAM: 48,
-    layers: 80,
-    description: 'Maximum quality. Needs a 48GB+ GPU or a Mac with 64GB+ unified memory.',
-  },
-];
+/**
+ * Bundled llama.cpp models — intentionally EMPTY.
+ *
+ * Briefcase no longer ships or downloads its own GGUF weights. Local inference
+ * is served entirely by Ollama, which the user manages themselves; cloud work
+ * goes to Claude or OpenAI. The llama.cpp plumbing (LlamaBridge / LlamaManager /
+ * ModelManagerService) is left intact and simply has nothing to offer, so the
+ * 'local' provider reports unavailable and the setup wizard lists no local
+ * models. Re-populating this array is all that's needed to revive it.
+ */
+export const COGITO_MODELS: CogitoModelDef[] = [];
 
 // ---------------- Whisper (speech-to-text) ----------------
 

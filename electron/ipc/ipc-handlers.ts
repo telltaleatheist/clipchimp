@@ -30,7 +30,7 @@ const store = new Store<Settings>({
   name: 'briefcase-settings',
   defaults: {
     lastUsedProvider: 'ollama',
-    lastUsedModel: 'qwen2.5:7b',
+    lastUsedModel: 'qwen3.8:27b',
     claudeApiKey: '',
     openaiApiKey: '',
   }

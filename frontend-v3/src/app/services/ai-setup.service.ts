@@ -200,7 +200,7 @@ export class AiSetupService {
     } else if (!isReady) {
       message = 'No AI providers configured';
     } else if (providers.includes('local')) {
-      message = 'Local AI ready (Cogito 8B)';
+      message = 'Local AI ready';
     } else if (providers.includes('ollama')) {
       message = `Ollama ready with ${avail.ollamaModels.length} model(s)`;
     } else {
@@ -329,7 +329,9 @@ export class AiSetupService {
         freeMemoryGB: response.freeMemoryGB || 0,
         cpuCores: response.cpuCores || 0,
         platform: response.platform || 'unknown',
-        recommendedModel: response.recommendedModel || 'cogito-8b',
+        // No bundled-GGUF catalog ships anymore, so there is no local model to
+        // fall back to — '' means "nothing to recommend".
+        recommendedModel: response.recommendedModel || '',
         gpu: response.gpu || null,
         useGpu: response.useGpu || false,
         effectiveMemoryGB: response.effectiveMemoryGB || response.totalMemoryGB || 0
@@ -341,7 +343,7 @@ export class AiSetupService {
           freeMemoryGB: 0,
           cpuCores: 0,
           platform: 'unknown',
-          recommendedModel: 'cogito-8b',
+          recommendedModel: '',
           gpu: null,
           useGpu: false,
           effectiveMemoryGB: 0
@@ -357,12 +359,12 @@ export class AiSetupService {
     return this.http.get<any>(`${this.API_BASE}/config/local-models`).pipe(
       map(response => ({
         models: response.models || [],
-        recommendedModel: response.recommendedModel || 'cogito-8b',
+        recommendedModel: response.recommendedModel || '',
         modelsDir: response.modelsDir || ''
       })),
       catchError(error => {
         console.error('Error getting local models:', error);
-        return of({ models: [], recommendedModel: 'cogito-8b', modelsDir: '' });
+        return of({ models: [], recommendedModel: '', modelsDir: '' });
       })
     );
   }
