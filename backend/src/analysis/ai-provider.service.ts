@@ -9,7 +9,7 @@ import {
   estimateNumCtx,
   stripThinkTags,
 } from './model-utils';
-import { negotiateOllamaThink } from './ollama-capabilities';
+import { negotiateOllamaThink, markGradedThinkUnsupported } from './ollama-capabilities';
 
 export interface AIProviderConfig {
   provider: 'local' | 'ollama' | 'claude' | 'openai';
@@ -33,6 +33,21 @@ export class AIProviderService {
   private readonly logger = new Logger(AIProviderService.name);
   private anthropic: Anthropic | null = null;
   private openai: OpenAI | null = null;
+
+  /**
+   * Ollama models THIS app has asked to load, as `${endpoint}::${model}`.
+   *
+   * Ollama is a shared daemon: other apps on this machine may have their own
+   * models resident. Releasing on shutdown must therefore be surgical — we
+   * unload only what Briefcase itself loaded, never "everything that is loaded".
+   */
+  private readonly ollamaModelsInUse = new Set<string>();
+
+  /** In-flight Ollama generations, so shutdown can cancel them. */
+  private readonly inFlightOllama = new Set<AbortController>();
+
+  /** True once shutdown has begun, so cancelled calls aren't logged as errors. */
+  private releasingOllama = false;
 
   constructor(private readonly llamaManager: LlamaManager) {}
 
@@ -132,7 +147,7 @@ export class AIProviderService {
         // Cloud providers get NO sampling params (see generateWithOpenAI).
         return this.generateWithOpenAI(prompt, config);
       case 'ollama':
-        return this.generateWithOllama(prompt, config, temperature);
+        return this.generateWithOllama(prompt, config, temperature, task);
       default:
         throw new Error(`Unsupported AI provider: ${config.provider}`);
     }
@@ -277,15 +292,17 @@ export class AIProviderService {
     prompt: string,
     config: AIProviderConfig,
     temperature: number,
+    task?: AITaskKind,
   ): Promise<AIResponse> {
     const ollamaEndpoint = config.ollamaEndpoint || 'http://localhost:11434';
 
-    // Negotiate thinking: analysis WANTS thinking-capable models (qwen3-class)
-    // to reason. Capable models get { think: true } and their chain-of-thought
-    // lands in the separate `thinking` response field (verified empirically);
-    // non-thinking models get no think field. A failed probe throws — no
-    // silent guessing.
-    const { fields: thinkFields, thinking } = await negotiateOllamaThink(ollamaEndpoint, config.model);
+    // Negotiate thinking PER TASK: only judgment-heavy tasks (flags, chapter)
+    // ask a capable model to reason, because a thinking call costs ~1,900+
+    // output tokens and generation time tracks output tokens. Capable models on
+    // those tasks get { think: true } and their chain-of-thought lands in the
+    // separate `thinking` response field (verified empirically); every other
+    // task, and every non-thinking model, gets no think field.
+    const { fields: thinkFields, thinking, level } = await negotiateOllamaThink(ollamaEndpoint, config.model, task);
 
     // num_predict must cover the generation that shares the context window with
     // the prompt. Thinking burns tokens on reasoning we discard, so budget
@@ -299,32 +316,61 @@ export class AIProviderService {
 
     this.logger.debug(
       `Ollama request: model=${config.model}, num_ctx=${numCtx}, num_predict=${numPredict}, ` +
-      `temperature=${temperature}, thinking=${thinking}`,
+      `temperature=${temperature}, thinking=${thinking}${level ? ` (${level})` : ''}`,
     );
 
+    // Remember what we loaded so shutdown can release exactly this and no more.
+    this.ollamaModelsInUse.add(`${ollamaEndpoint}::${config.model}`);
+
+    // Own the AbortController rather than using AbortSignal.timeout, so shutdown
+    // can cancel a generation in progress. Ollama serializes requests per model,
+    // so an unload queued behind a running 2-minute call would never land inside
+    // the shutdown budget — cancelling first is what makes release possible.
+    // 10 minutes, not 5. This clock starts when the request is ISSUED, but Ollama
+    // queues requests it cannot serve concurrently — so a queued call spends most
+    // of its budget waiting, not generating. A measured flag call already takes
+    // ~230s of pure generation; at the old 300s a single queued request was
+    // aborted after 69s of real work and retried from scratch, costing more time
+    // than it saved.
+    const controller = new AbortController();
+    const timeoutHandle = setTimeout(() => controller.abort(), 600000);
+    this.inFlightOllama.add(controller);
+
     try {
-      const response = await fetch(`${ollamaEndpoint}/api/generate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        // A wedged Ollama must not block the serialized pipeline forever.
-        signal: AbortSignal.timeout(300000),
-        body: JSON.stringify({
-          model: config.model,
-          prompt: prompt,
-          stream: false,
-          // Per-call keep_alive keeps the model resident across the whole job
-          // without needing an out-of-band ping timer.
-          keep_alive: '5m',
-          ...thinkFields,
-          options: {
-            num_ctx: numCtx,
-            num_predict: numPredict,
-            temperature,
+      const post = (fields: Record<string, unknown>) =>
+        fetch(`${ollamaEndpoint}/api/generate`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
           },
-        }),
-      });
+          // A wedged Ollama must not block the serialized pipeline forever.
+          signal: controller.signal,
+          body: JSON.stringify({
+            model: config.model,
+            prompt: prompt,
+            stream: false,
+            // Per-call keep_alive keeps the model resident across the whole job
+            // without needing an out-of-band ping timer.
+            keep_alive: '5m',
+            ...fields,
+            options: {
+              num_ctx: numCtx,
+              num_predict: numPredict,
+              temperature,
+            },
+          }),
+        });
+
+      let response = await post(thinkFields);
+
+      // Graded think levels are only honored "for supported models" and there is
+      // no capability flag for it. A 4xx while sending one means this model does
+      // not take levels — remember that and retry once with plain think:true,
+      // rather than failing a task over a performance optimization.
+      if (!response.ok && level && response.status >= 400 && response.status < 500) {
+        markGradedThinkUnsupported(ollamaEndpoint, config.model);
+        response = await post({ think: true });
+      }
 
       if (!response.ok) {
         throw new Error(`Ollama API returned status ${response.status}`);
@@ -355,9 +401,62 @@ export class AIProviderService {
         model: config.model,
       };
     } catch (error) {
+      // A cancelled generation during shutdown is expected, not a fault.
+      if (this.releasingOllama) {
+        throw new Error('Ollama request cancelled: application is shutting down');
+      }
       this.logger.error(`Ollama API error: ${(error as Error).message}`);
       throw new Error(`Ollama API error: ${(error as Error).message}`);
+    } finally {
+      clearTimeout(timeoutHandle);
+      this.inFlightOllama.delete(controller);
     }
+  }
+
+  /**
+   * Release every Ollama model THIS app loaded, so quitting Briefcase frees the
+   * VRAM instead of leaving 17-25GB resident until Ollama's keep_alive expires.
+   *
+   * Ollama is a shared daemon and other apps may have their own models loaded,
+   * so this unloads only the models tracked in `ollamaModelsInUse` — never a
+   * blanket unload. `keep_alive: 0` with no prompt is Ollama's unload request.
+   *
+   * Never throws: shutdown must proceed even if Ollama is already gone.
+   */
+  async releaseOllamaModels(): Promise<void> {
+    if (this.ollamaModelsInUse.size === 0) return;
+    this.releasingOllama = true;
+
+    // Cancel in-flight generations FIRST. Ollama serializes per model, so an
+    // unload sent while a long call is running would sit in the queue until it
+    // finished — long past the point the process gets killed.
+    for (const controller of this.inFlightOllama) {
+      try { controller.abort(); } catch { /* already settled */ }
+    }
+    this.inFlightOllama.clear();
+
+    const targets = [...this.ollamaModelsInUse];
+    this.ollamaModelsInUse.clear();
+
+    await Promise.all(
+      targets.map(async (key) => {
+        const sep = key.indexOf('::');
+        const endpoint = key.slice(0, sep);
+        const model = key.slice(sep + 2);
+        try {
+          await fetch(`${endpoint}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            // Must fit inside the parent's shutdown grace period.
+            signal: AbortSignal.timeout(2000),
+            body: JSON.stringify({ model, keep_alive: 0 }),
+          });
+          this.logger.log(`[Shutdown] Released Ollama model: ${model}`);
+        } catch (error) {
+          this.logger.warn(`[Shutdown] Could not release ${model}: ${(error as Error).message}`);
+        }
+      }),
+    );
   }
 
   /**

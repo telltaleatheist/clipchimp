@@ -68,7 +68,7 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
     aiAnalysis: false,
     aiModel: '',
     customInstructions: '',
-    analysisGranularity: 5, // Default to middle (balanced)
+    analysisGranularity: 2, // Default to middle (balanced)
     outputFormat: 'mp4',
     outputQuality: 'high'
   };
@@ -121,23 +121,17 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
   }
 
   getGranularityLabel(): string {
-    const value = this.settings.analysisGranularity || 5;
-    if (value <= 2) return 'Very Strict';
-    if (value <= 4) return 'Strict';
-    if (value <= 6) return 'Balanced';
-    if (value <= 8) return 'Broad';
-    if (value === 9) return 'Very Aggressive';
-    return 'Maximum';
+    const value = this.settings.analysisGranularity || 2;
+    if (value <= 1) return 'Strong matches only';
+    if (value === 2) return 'Balanced';
+    return 'Aggressive';
   }
 
   getGranularityDescription(): string {
-    const value = this.settings.analysisGranularity || 5;
-    if (value <= 2) return 'Only flag content that clearly and definitively matches categories';
-    if (value <= 4) return 'Flag content with high confidence matches';
-    if (value <= 6) return 'Flag content with reasonable confidence';
-    if (value <= 8) return 'Flag content including edge cases and possible matches';
-    if (value === 9) return 'Flag all possible matches, including weak associations';
-    return 'Flag EVERYTHING remotely related - metaphors, implications, tangential references';
+    const value = this.settings.analysisGranularity || 2;
+    if (value <= 1) return 'Only explicit, unmistakable matches. Fewest false positives.';
+    if (value === 2) return 'Clear matches plus reasonably likely ones.';
+    return 'Everything that could match, including implication and coded language. Expect more to review.';
   }
 
   getAudioLevelLabel(): string {
@@ -170,7 +164,7 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
 
   onGranularityChange() {
     // Auto-save granularity when it changes
-    this.libraryService.saveDefaultGranularity(this.settings.analysisGranularity || 5).subscribe({
+    this.libraryService.saveDefaultGranularity(this.settings.analysisGranularity || 2).subscribe({
       next: (response) => {
         if (response.success) {
           console.log('Saved default granularity:', response.granularity);
@@ -503,7 +497,7 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
       aiAnalysis: false,
       aiModel: '', // Will be set from saved default when dialog reopens
       customInstructions: '',
-      analysisGranularity: 5, // Default to middle (balanced)
+      analysisGranularity: 2, // Default to middle (balanced)
       outputFormat: 'mp4',
       outputQuality: 'high'
     };

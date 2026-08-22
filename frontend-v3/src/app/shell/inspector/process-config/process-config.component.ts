@@ -342,31 +342,32 @@ export class ProcessConfigComponent {
     void this.loadInstructionsHistory();
   }
 
-  // Detection sensitivity (analysisGranularity, 1..10) ------------------------
+  // Detection sensitivity (analysisGranularity, 1..3) -------------------------
 
   granularityLoading = signal(false);
   granularityError = signal(false);
 
-  granularityValue = computed(() => Number(this.config('ai-analyze')['analysisGranularity'] ?? 5));
+  // Legacy configs stored a 1-10 value; fold those onto the 1-3 scale so the
+  // slider doesn't sit pinned at max after the migration.
+  granularityValue = computed(() => {
+    const raw = Number(this.config('ai-analyze')['analysisGranularity'] ?? 2);
+    if (!Number.isFinite(raw)) return 2;
+    if (raw > 3) return raw <= 7 ? 2 : 3;
+    return Math.min(3, Math.max(1, Math.round(raw)));
+  });
   granularityLabel = computed(() => this.getGranularityLabel(this.granularityValue()));
   granularityDescription = computed(() => this.getGranularityDescription(this.granularityValue()));
 
   getGranularityLabel(value: number): string {
-    if (value <= 2) return 'Very Strict';
-    if (value <= 4) return 'Strict';
-    if (value <= 6) return 'Balanced';
-    if (value <= 8) return 'Broad';
-    if (value === 9) return 'Very Aggressive';
-    return 'Maximum';
+    if (value <= 1) return 'Strong matches only';
+    if (value === 2) return 'Balanced';
+    return 'Aggressive';
   }
 
   getGranularityDescription(value: number): string {
-    if (value <= 2) return 'Only flag content that clearly and definitively matches categories';
-    if (value <= 4) return 'Flag content with high confidence matches';
-    if (value <= 6) return 'Flag content with reasonable confidence';
-    if (value <= 8) return 'Flag content including edge cases and possible matches';
-    if (value === 9) return 'Flag all possible matches, including weak associations';
-    return 'Flag EVERYTHING remotely related - metaphors, implications, tangential references';
+    if (value <= 1) return 'Only explicit, unmistakable matches. Fewest false positives.';
+    if (value === 2) return 'Clear matches plus reasonably likely ones.';
+    return 'Everything that could match, including implication and coded language. Expect more to review.';
   }
 
   /** Load the saved default sensitivity (surfaced with retry — never silent). */

@@ -89,7 +89,7 @@ export interface AnalyzeTask extends BaseTask {
     apiKey?: string;
     ollamaEndpoint?: string;
     customInstructions?: string;
-    analysisGranularity?: number; // 1-10: 1 = strict, 10 = aggressive
+    analysisGranularity?: number; // 1-3: 1 = strong matches only, 3 = aggressive
   };
 }
 

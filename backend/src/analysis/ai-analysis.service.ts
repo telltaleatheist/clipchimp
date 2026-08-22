@@ -3,18 +3,22 @@
  *
  * This service implements a two-pass approach to video analysis:
  *   Pass 1: Detect chapter boundaries (chunked, lightweight)
- *   Pass 2: Analyze each chapter with full context (title, summary, category flags)
+ *   Pass 2: Analyze each chapter with full context (title, summary)
+ *   Pass 2b: Extract category flags per chapter, as a dedicated call
  *
  * Metadata (description, tags, title) is generated from chapter summaries.
  */
 import { Injectable, Logger } from '@nestjs/common';
 import { AIProviderService, AIProviderConfig } from './ai-provider.service';
 import { OllamaService } from './ollama.service';
-import { numCtxMaxForModel, stripThinkTags, parseProviderModel } from './model-utils';
+import { numCtxMaxForModel, stripThinkTags, parseProviderModel, AITaskKind } from './model-utils';
+import { ApiKeysService } from '../config/api-keys.service';
 import * as fs from 'fs';
+import * as path from 'path';
 import {
   buildBoundaryDetectionPrompt,
   buildChapterAnalysisPrompt,
+  buildFlagExtractionPrompt,
   interpolatePrompt,
   DESCRIPTION_FROM_CHAPTERS_PROMPT,
   TAGS_FROM_CHAPTERS_PROMPT,
@@ -111,7 +115,7 @@ export interface AnalysisOptions {
   segments: Segment[];
   outputFile: string;
   customInstructions?: string;
-  analysisGranularity?: number; // 1-10: 1 = strict, 10 = aggressive
+  analysisGranularity?: number; // 1-3: 1 = strong matches only, 3 = aggressive
   videoTitle?: string;
   categories?: AnalysisCategory[];
   apiKey?: string;
@@ -145,6 +149,46 @@ export interface AnalysisResult {
 
 const MAX_RETRIES = 3;
 const JSON_PARSE_RETRIES = 2;
+
+/**
+ * Tasks whose model may be overridden via `taskModels` in app-config.json.
+ *
+ * EVERY task is routable. The three that read raw transcript (boundary, chapter,
+ * flags) are safe to route because the chunk/chapter caps are computed as the
+ * MOST CONSERVATIVE limits across whichever models those tasks resolve to — see
+ * `perTaskLimits` in analyzeTranscript. Sizing to one model while another does
+ * the reading is what would silently truncate prompts, so the caps follow the
+ * smallest context in play.
+ *
+ * Tasks are executed grouped by model (chaptering, then Pass 2b, then metadata
+ * ordered main-model-first), so each routed model loads once rather than being
+ * swapped in and out per call.
+ */
+const ROUTABLE_TASKS = ['boundary', 'chapter', 'flags', 'description', 'tags', 'title'] as const;
+
+/**
+ * How many chapters have their flags extracted at once (Pass 2b).
+ *
+ * Flag extraction is the only embarrassingly parallel step in the pipeline: each
+ * chapter's extraction reads only that chapter's text and threads no state
+ * forward. (Chapter analysis cannot be parallelized — it carries
+ * previousChapterSummary.) Since LLM generation is memory-bandwidth-bound,
+ * concurrent requests against one resident model raise total throughput rather
+ * than just splitting it.
+ *
+ * DEFAULTS TO 1, because concurrency here is only safe once Ollama is allowed to
+ * serve the requests in parallel. With OLLAMA_NUM_PARALLEL unset, Ollama QUEUES
+ * the extra request — it is not merely a no-op, it is actively harmful: the
+ * queued call burns its client-side timeout waiting its turn and gets aborted
+ * and retried, which cost ~5 minutes in a measured run.
+ *
+ * To actually enable it: set OLLAMA_NUM_PARALLEL >= N on the Ollama server AND
+ * BRIEFCASE_FLAG_CONCURRENCY=N here. Both, or neither.
+ */
+const FLAG_EXTRACTION_CONCURRENCY = Math.max(
+  1,
+  Number(process.env.BRIEFCASE_FLAG_CONCURRENCY) || 1,
+);
 
 // Job-level failure accounting. Any analysis step that cannot produce a real
 // result — a boundary chunk that won't parse after a retry, a chapter that
@@ -531,13 +575,104 @@ export class AIAnalysisService {
   constructor(
     private readonly aiProviderService: AIProviderService,
     private readonly ollamaService: OllamaService,
+    private readonly apiKeysService: ApiKeysService,
   ) {}
+
+  /**
+   * Per-task model routing, read from `taskModels` in app-config.json:
+   *
+   *   "taskModels": { "tags": "ollama:qwen3.5:9b", "description": "ollama:qwen3.5:9b" }
+   *
+   * Values are "provider:model" strings; a task with no entry uses the job's
+   * main model. The point is to let cheap, narrow tasks (metadata generation)
+   * run on a small fast model while chapter analysis keeps the big one.
+   *
+   * Returns {} on any read/parse failure — routing is an optimization, and a
+   * malformed config must not take the whole analysis down.
+   */
+  private loadTaskModelOverrides(): Partial<Record<AITaskKind, string>> {
+    try {
+      const userDataPath =
+        process.env.APPDATA ||
+        (process.platform === 'darwin'
+          ? path.join(process.env.HOME || '', 'Library', 'Application Support')
+          : path.join(process.env.HOME || '', '.config'));
+      const configPath = path.join(userDataPath, 'briefcase', 'app-config.json');
+      if (!fs.existsSync(configPath)) return {};
+
+      const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'))?.taskModels;
+      if (!raw || typeof raw !== 'object') return {};
+
+      const out: Partial<Record<AITaskKind, string>> = {};
+      for (const task of ROUTABLE_TASKS) {
+        if (typeof raw[task] === 'string' && raw[task].trim()) out[task] = raw[task].trim();
+      }
+
+      // The transcript-facing tasks are deliberately NOT routable: chunk and
+      // chapter character caps are derived from the main model's context window
+      // (see getModelLimits), so pointing them at a differently-sized model would
+      // silently mis-size every prompt. Warn loudly instead of ignoring quietly.
+      const rejected = Object.keys(raw).filter(
+        (k) => !ROUTABLE_TASKS.includes(k as (typeof ROUTABLE_TASKS)[number]),
+      );
+      if (rejected.length) {
+        this.logger.warn(
+          `[TaskModels] Ignoring non-routable task override(s): ${rejected.join(', ')}. ` +
+          `Only ${ROUTABLE_TASKS.join(', ')} can be routed — the others drive context sizing.`,
+        );
+      }
+      return out;
+    } catch (error) {
+      this.logger.warn(`[TaskModels] Ignoring unreadable taskModels config: ${(error as Error).message}`);
+      return {};
+    }
+  }
+
+  /**
+   * Resolve the provider config for one task, applying any `taskModels` override.
+   *
+   * The API key is re-resolved for the override's provider — routing a task to
+   * Claude while the base job runs on Ollama must not send Ollama's (absent) key.
+   * An override naming a cloud provider with no configured key is ignored rather
+   * than allowed to fail the task.
+   */
+  private resolveTaskConfig(
+    base: AIProviderConfig,
+    task: AITaskKind,
+    overrides: Partial<Record<AITaskKind, string>>,
+  ): AIProviderConfig {
+    const spec = overrides[task];
+    if (!spec) return base;
+
+    const parsed = parseProviderModel(spec);
+    const provider = parsed.provider ?? base.provider;
+    const model = parsed.model;
+    if (!model || (provider === base.provider && model === base.model)) return base;
+
+    let apiKey = base.apiKey;
+    if (provider !== base.provider) {
+      if (provider === 'claude') apiKey = this.apiKeysService.getClaudeApiKey();
+      else if (provider === 'openai') apiKey = this.apiKeysService.getOpenAiApiKey();
+      else apiKey = undefined; // ollama / local need none
+
+      if ((provider === 'claude' || provider === 'openai') && !apiKey) {
+        this.logger.warn(
+          `[TaskModels] Ignoring '${task}' -> ${spec}: no ${provider} API key configured.`,
+        );
+        return base;
+      }
+    }
+
+    this.logger.log(`[TaskModels] ${task} -> ${provider}:${model}`);
+    return { ...base, provider, model, apiKey };
+  }
 
   /**
    * Main entry point: Analyze transcript using AI
    * Uses two-pass chapter-centric analysis:
    *   Pass 1: Detect chapter boundaries (chunked, lightweight)
-   *   Pass 2: Analyze each chapter with full context (title, summary, flags)
+   *   Pass 2: Analyze each chapter with full context (title, summary)
+   *   Pass 2b: Extract category flags per chapter, as a dedicated call
    */
   async analyzeTranscript(options: AnalysisOptions): Promise<AnalysisResult> {
     console.log('=== AIAnalysisService.analyzeTranscript CALLED (Two-Pass) ===');
@@ -676,20 +811,65 @@ export class AIAnalysisService {
         ollamaEndpoint,
       };
 
-      // Effective context window the runner will actually use — drives the
-      // chunk/chapter char caps so long transcripts are never silently truncated.
-      const contextTokens =
-        provider === 'local'
+      // Per-task model routing. Metadata tasks are narrow and cheap, so they can
+      // run on a small fast model while chapter work keeps the big one. The three
+      // metadata calls run consecutively at the end of the job, so routing all of
+      // them to the same model costs exactly ONE model swap, not three.
+      const taskModels = this.loadTaskModelOverrides();
+
+      // Effective context window each raw-transcript task will actually use.
+      //
+      // boundary / chapter / flags all read raw transcript, and each may now be
+      // routed to a DIFFERENT model. One shared set of caps therefore has to be
+      // safe for all of them, so every limit is the most CONSERVATIVE across the
+      // resolved models: sizing to the main model alone would overflow a smaller
+      // routed model's context and silently truncate its prompt.
+      const contextFor = (cfg: AIProviderConfig): number =>
+        cfg.provider === 'local'
           ? 8192 // pinned llama.cpp server context (-c 8192)
-          : provider === 'ollama'
-            ? numCtxMaxForModel(model) // what we request as num_ctx
+          : cfg.provider === 'ollama'
+            ? numCtxMaxForModel(cfg.model) // what we request as num_ctx
             : 128000; // claude/openai have large windows
 
-      // Get model-specific limits
-      const modelLimits = getModelLimits(model, contextTokens);
+      const rawTranscriptTasks: AITaskKind[] = ['boundary', 'chapter', 'flags'];
+      const perTaskLimits = rawTranscriptTasks.map((t) => {
+        const cfg = this.resolveTaskConfig(aiConfig, t, taskModels);
+        const ctx = contextFor(cfg);
+        return { task: t, model: cfg.model, ctx, limits: getModelLimits(cfg.model, ctx) };
+      });
+
+      // Two different rules, deliberately:
+      //
+      //  - CHARACTER caps are a CORRECTNESS guarantee and take the minimum. A
+      //    model reading text sized for a larger model's context would silently
+      //    truncate its prompt, losing transcript with no error.
+      //
+      //  - TIME granularity is a QUALITY heuristic (getModelLimits tiers span by
+      //    model size) and follows the MAIN model. Taking the minimum here would
+      //    shrink chapters whenever chaptering is routed to a small model, which
+      //    creates MORE chapters and therefore more calls for whatever expensive
+      //    model does flag extraction — the opposite of why routing exists.
+      const mainLimits = getModelLimits(model, contextFor(aiConfig));
+      const contextTokens = Math.min(...perTaskLimits.map((x) => x.ctx));
+      const modelLimits: ModelLimits = {
+        maxChunkChars: Math.min(...perTaskLimits.map((x) => x.limits.maxChunkChars)),
+        maxChapterChars: Math.min(...perTaskLimits.map((x) => x.limits.maxChapterChars)),
+        chunkMinutes: mainLimits.chunkMinutes,
+        maxChapterSeconds: mainLimits.maxChapterSeconds,
+      };
+
+      const distinct = [...new Set(perTaskLimits.map((x) => x.model))];
+      if (distinct.length > 1) {
+        this.logger.log(
+          `[Model Limits] raw-transcript tasks span ${distinct.length} models (${perTaskLimits
+            .map((x) => `${x.task}=${x.model}@${x.ctx}`)
+            .join(', ')}) — using the most conservative limits`,
+        );
+      }
       this.logger.log(
-        `[Model Limits] ${model} (ctx=${contextTokens}): chunkMinutes=${modelLimits.chunkMinutes}, ` +
-        `maxChunkChars=${modelLimits.maxChunkChars}, maxChapterChars=${modelLimits.maxChapterChars}`,
+        `[Model Limits] effective ctx=${contextTokens}: chunkMinutes=${modelLimits.chunkMinutes}, ` +
+        `maxChunkChars=${modelLimits.maxChunkChars}, maxChapterChars=${modelLimits.maxChapterChars}, ` +
+        `maxChapterSeconds=${modelLimits.maxChapterSeconds}`,
       );
 
       // =========================================================================
@@ -697,18 +877,28 @@ export class AIAnalysisService {
       // =========================================================================
       sendProgress('analysis', 5, 'Detecting chapter boundaries...');
       const boundaries = await this.detectChapterBoundaries(
-        aiConfig,
+        this.resolveTaskConfig(aiConfig, 'boundary', taskModels),
         segments,
         videoTitle,
         modelLimits,
         recordFailure,
         trackTokens,
+        // Pass 1 owns the 5%-25% band; walk it as chunks complete so the queue
+        // sees steady progress instead of a frozen 5% for the whole pass.
+        (current, total) => {
+          const pct = 5 + Math.round((current / Math.max(1, total)) * 20);
+          sendProgress('analysis', pct, `Detecting chapter boundaries (${current}/${total} chunks)...`);
+        },
       );
       sendProgress('analysis', 25, `Found ${boundaries.length} chapters`);
 
       // Calculate total API calls for accurate progress reporting
       // Pass 2 = 1 call per chapter, plus 3 more for description, tags, title
-      totalApiCalls = boundaries.length + 3;
+      // chapters + one flag-extraction call each + description/tags/title.
+      // Omitting the flag pass here is what produced negative ETAs and a
+      // "4/4 API calls" counter on a run that actually made seven.
+      let chapterCallCount = boundaries.length;
+      totalApiCalls = chapterCallCount * 2 + 3;
       completedApiCalls = 0;
       pass2StartTime = Date.now();  // Start timing from Pass 2 for accurate ETA
 
@@ -719,7 +909,7 @@ export class AIAnalysisService {
       };
 
       // =========================================================================
-      // PASS 2: Analyze each chapter (title, summary, category flags)
+      // PASS 2: Analyze each chapter (title, summary), then extract flags (2b)
       // =========================================================================
       sendProgress('analysis', 26, `Analyzing ${boundaries.length} chapters (0/${totalApiCalls} API calls)...`);
       const { chapters, flags } = await this.analyzeChaptersPass2(
@@ -734,9 +924,21 @@ export class AIAnalysisService {
         analysisGranularity,
         trackTokens,
         (current, total) => {
+          // Post-split chapter count is only known here; correct the estimate so
+          // the ETA stops drifting when Pass 2 splits long chapters.
+          if (total !== chapterCallCount) {
+            chapterCallCount = total;
+            totalApiCalls = chapterCallCount * 2 + 3;
+          }
           completedApiCalls = current;
           const progress = calculateProgress();
           sendProgress('analysis', progress, `Analyzing chapter ${current}/${total} (${completedApiCalls}/${totalApiCalls} API calls)...`);
+        },
+        taskModels,
+        (current, total) => {
+          completedApiCalls = chapterCallCount + current;
+          const progress = calculateProgress();
+          sendProgress('analysis', progress, `Finding flagged quotes ${current}/${total} (${completedApiCalls}/${totalApiCalls} API calls)...`);
         },
       );
       sendProgress('analysis', calculateProgress(), `Analyzed ${chapters.length} chapters, found ${flags.length} flags`);
@@ -763,34 +965,74 @@ export class AIAnalysisService {
       // =========================================================================
       // Generate metadata FROM chapters
       // =========================================================================
-      completedApiCalls++;
-      sendProgress('analysis', calculateProgress(), `Generating description (${completedApiCalls}/${totalApiCalls} API calls)...`);
-      const description = await this.generateDescriptionFromChapters(
-        aiConfig,
-        chapters,
-        videoTitle,
-        recordFailure,
-        trackTokens,
-      );
+      // These three are independent functions of `chapters` — none reads another's
+      // result — so they may run in any order. They are therefore ORDERED BY
+      // MODEL, not by name: everything still on the main model runs first (it is
+      // already resident from Pass 2), then each override model in turn. Each
+      // model is loaded exactly once and we never swap back to one we've left.
+      //
+      // This matters because a swap-back is the expensive case: reloading a 27B
+      // costs far more than the metadata calls it would be interleaved with, so
+      // grouping is what makes routing a win instead of a wash. Ordering here
+      // rather than relying on the config's task order means any taskModels
+      // combination gets the minimum number of loads automatically.
+      let description: string | null = null;
+      let tags: Tags | null = null;
+      let suggestedTitle: string | null = null;
 
-      completedApiCalls++;
-      sendProgress('analysis', calculateProgress(), `Extracting tags (${completedApiCalls}/${totalApiCalls} API calls)...`);
-      const tags = await this.generateTagsFromChapters(
-        aiConfig,
-        chapters,
-        recordFailure,
-        trackTokens,
-      );
+      const metadataSteps = (
+        [
+          { task: 'description', label: 'Generating description' },
+          { task: 'tags', label: 'Extracting tags' },
+          { task: 'title', label: 'Generating title' },
+        ] as const
+      ).map((step) => {
+        const cfg = this.resolveTaskConfig(aiConfig, step.task, taskModels);
+        return { ...step, cfg, key: `${cfg.provider}:${cfg.model}` };
+      });
 
-      completedApiCalls++;
-      sendProgress('analysis', calculateProgress(), `Generating title (${completedApiCalls}/${totalApiCalls} API calls)...`);
-      const suggestedTitle = await this.generateTitleFromChapters(
-        aiConfig,
-        chapters,
-        videoTitle,
-        recordFailure,
-        trackTokens,
-      );
+      const mainKey = `${aiConfig.provider}:${aiConfig.model}`;
+      // Main model first (already loaded), then each other model in first-appearance
+      // order. Stable within a group, so same-model tasks keep their relative order.
+      const orderedKeys = [
+        ...(metadataSteps.some((s) => s.key === mainKey) ? [mainKey] : []),
+        ...metadataSteps
+          .map((s) => s.key)
+          .filter((k, i, arr) => k !== mainKey && arr.indexOf(k) === i),
+      ];
+      if (orderedKeys.length > 1) {
+        this.logger.log(
+          `[TaskModels] Metadata runs grouped by model, one load each: ${orderedKeys.join(' -> ')}`,
+        );
+      }
+
+      for (const key of orderedKeys) {
+        for (const step of metadataSteps.filter((s) => s.key === key)) {
+          completedApiCalls++;
+          sendProgress(
+            'analysis',
+            calculateProgress(),
+            `${step.label} (${completedApiCalls}/${totalApiCalls} API calls)...`,
+          );
+          switch (step.task) {
+            case 'description':
+              description = await this.generateDescriptionFromChapters(
+                step.cfg, chapters, videoTitle, recordFailure, trackTokens,
+              );
+              break;
+            case 'tags':
+              tags = await this.generateTagsFromChapters(
+                step.cfg, chapters, recordFailure, trackTokens,
+              );
+              break;
+            case 'title':
+              suggestedTitle = await this.generateTitleFromChapters(
+                step.cfg, chapters, videoTitle, recordFailure, trackTokens,
+              );
+              break;
+          }
+        }
+      }
 
       // Prepend summary to file (only when a real description was produced;
       // a failed description is null and must not become a placeholder).
@@ -1118,6 +1360,7 @@ export class AIAnalysisService {
     limits: ModelLimits,
     recordFailure: (what: string) => void,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
+    onChunkProgress?: (current: number, total: number) => void,
   ): Promise<number[]> {
     const boundaries: number[] = [0]; // First chapter always starts at 0
     let previousTopic = '';
@@ -1170,6 +1413,13 @@ export class AIAnalysisService {
         }
         if (attempt < 1) await this.delay(1000);
       }
+
+      // Report after every chunk, INCLUDING failed ones. This is what keeps
+      // lastProgressAt moving during Pass 1: without it the whole pass (plus the
+      // model load in front of it) elapses at a frozen 5%, which trips the
+      // queue's stall warning on any slow model and hides a genuinely wedged
+      // Ollama behind a false positive.
+      onChunkProgress?.(i + 1, chunks.length);
 
       if (!result) {
         recordFailure(
@@ -1277,11 +1527,9 @@ export class AIAnalysisService {
     config: AIProviderConfig,
     chapterText: string,
     videoTitle: string,
-    categories: AnalysisCategory[],
     chapterNumber: number,
     previousChapterSummary: string,
     customInstructions: string | undefined,
-    analysisGranularity: number | undefined,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
   ): Promise<ChapterAnalysisResult> {
     const maxRetries = JSON_PARSE_RETRIES;
@@ -1294,11 +1542,9 @@ export class AIAnalysisService {
         const prompt = buildChapterAnalysisPrompt(
           videoTitle,
           chapterText,
-          categories,
           chapterNumber,
           previousChapterSummary,
           customInstructions,
-          analysisGranularity,
         );
 
         const response = await this.aiProviderService.generateText(prompt, config, 'chapter');
@@ -1344,6 +1590,97 @@ export class AIAnalysisService {
   }
 
   /**
+   * PASS 2b: Extract category flags for one chapter, as a DEDICATED call.
+   *
+   * Split out from chapter titling so the model spends its whole budget looking
+   * for matches instead of treating `flags` as a third field to fill in after
+   * the title and summary.
+   *
+   * Unlike chapter analysis this NEVER throws: flags are additive findings, so a
+   * chapter whose extraction fails still keeps its title and summary rather than
+   * failing the whole chapter. A failure returns [] and is logged — the caller
+   * counts it via `onFailure` so a systematically broken extraction is still
+   * visible rather than silently producing an unflagged video.
+   */
+  private async extractChapterFlags(
+    config: AIProviderConfig,
+    chapterText: string,
+    videoTitle: string,
+    categories: AnalysisCategory[],
+    chapterNumber: number,
+    sensitivity: number | undefined,
+    customInstructions: string | undefined,
+    onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
+    onFailure?: (message: string) => void,
+  ): Promise<ChapterFlag[]> {
+    const enabled = categories?.filter((c) => c.enabled !== false) || [];
+    if (enabled.length === 0) return [];
+
+    const prompt = buildFlagExtractionPrompt(
+      videoTitle,
+      chapterText,
+      categories,
+      chapterNumber,
+      sensitivity,
+      customInstructions,
+    );
+
+    let lastError = '';
+    for (let attempt = 0; attempt <= JSON_PARSE_RETRIES; attempt++) {
+      try {
+        const response = await this.aiProviderService.generateText(prompt, config, 'flags');
+        onTokens?.(response);
+
+        if (response?.text) {
+          const parsed = this.parseFlagExtractionResponse(response.text);
+          if (parsed) return parsed;
+          this.logger.warn(
+            `[Pass 2b] Chapter ${chapterNumber} flag response unparseable (attempt ${attempt + 1})`,
+          );
+        } else {
+          this.logger.warn(`[Pass 2b] No flag response for chapter ${chapterNumber} (attempt ${attempt + 1})`);
+        }
+      } catch (error) {
+        lastError = (error as Error).message;
+        this.logger.warn(
+          `[Pass 2b] Error extracting flags for chapter ${chapterNumber} (attempt ${attempt + 1}): ${lastError}`,
+        );
+      }
+      if (attempt < JSON_PARSE_RETRIES) await this.delay(1000 * (attempt + 1));
+    }
+
+    onFailure?.(
+      `Pass 2b chapter ${chapterNumber} flag extraction failed` + (lastError ? `: ${lastError}` : ''),
+    );
+    return [];
+  }
+
+  /**
+   * Parse the dedicated flag-extraction response. Returns null when the payload
+   * is not usable at all (so the caller can retry) and [] when the model
+   * legitimately reported no matches.
+   */
+  private parseFlagExtractionResponse(text: string): ChapterFlag[] | null {
+    // Same multi-strategy parser the chapter path uses, so a thinking model's
+    // stray prose around the JSON is salvaged identically.
+    const parsed = safeJsonParse<Record<string, unknown>>(text, this.logger);
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    const raw = parsed.flags;
+    if (!Array.isArray(raw)) return null;
+
+    return raw.filter((f): f is ChapterFlag => {
+      return (
+        !!f &&
+        typeof f === 'object' &&
+        typeof (f as ChapterFlag).category === 'string' &&
+        (typeof (f as ChapterFlag).description === 'string' ||
+          typeof (f as ChapterFlag).quote === 'string')
+      );
+    });
+  }
+
+  /**
    * Simple delay helper for retry backoff
    */
   private delay(ms: number): Promise<void> {
@@ -1352,7 +1689,7 @@ export class AIAnalysisService {
 
   /**
    * PASS 2: Analyze each chapter with full context
-   * Generates title, summary, and category flags for each chapter
+   * Generates title and summary per chapter, then runs the dedicated flag pass
    */
   private async analyzeChaptersPass2(
     config: AIProviderConfig,
@@ -1366,6 +1703,8 @@ export class AIAnalysisService {
     analysisGranularity?: number,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
     onChapterProgress?: (current: number, total: number) => void,
+    taskModels: Partial<Record<AITaskKind, string>> = {},
+    onFlagProgress?: (current: number, total: number) => void,
   ): Promise<{ chapters: Chapter[]; flags: AnalyzedSection[] }> {
     const chapters: Chapter[] = [];
     const allFlags: AnalyzedSection[] = [];
@@ -1388,6 +1727,23 @@ export class AIAnalysisService {
     let previousChapterSummary = '';
 
     this.logger.log(`[Pass 2] Analyzing ${adjustedBoundaries.length} chapters (max ${limits.maxChapterChars} chars each)`);
+
+    // Chapter analysis may be routed to its own (typically smaller) model. All
+    // chapter calls run consecutively, so this model loads once.
+    const chapterConfig = this.resolveTaskConfig(config, 'chapter', taskModels);
+    if (chapterConfig.model !== config.model) {
+      this.logger.log(`[Pass 2] Analyzing chapters on ${chapterConfig.provider}:${chapterConfig.model}`);
+    }
+
+    // Chapters that succeeded and still need flag extraction (Pass 2b).
+    const pendingFlagWork: Array<{
+      index: number;
+      chapterNumber: number;
+      truncatedText: string;
+      chapterSegments: Segment[];
+      startTime: number;
+      endTime: number;
+    }> = [];
 
     for (let i = 0; i < adjustedBoundaries.length; i++) {
       const startTime = adjustedBoundaries[i];
@@ -1423,14 +1779,12 @@ export class AIAnalysisService {
       let result: ChapterAnalysisResult;
       try {
         result = await this.analyzeChapterWithRetry(
-          config,
+          chapterConfig,
           truncatedText,
           videoTitle,
-          categories,
           i + 1,
           previousChapterSummary,
           customInstructions,
-          analysisGranularity,
           onTokens,
         );
       } catch (error) {
@@ -1450,6 +1804,19 @@ export class AIAnalysisService {
         continue;
       }
 
+      // Flag extraction deliberately does NOT happen here — see the Pass 2b loop
+      // below. Running it inline would alternate chapter/flags per iteration,
+      // which reloads an 18GB model between every call the moment the two tasks
+      // are routed to different models.
+      pendingFlagWork.push({
+        index: i,
+        chapterNumber: i + 1,
+        truncatedText,
+        chapterSegments,
+        startTime,
+        endTime,
+      });
+
       // Create chapter entry
       chapters.push({
         sequence: i + 1,
@@ -1467,53 +1834,115 @@ export class AIAnalysisService {
       // Save summary for next chapter's context
       previousChapterSummary = result.summary;
 
-      // Convert flags to AnalyzedSection format - pass through without filtering
-      if (result.flags && result.flags.length > 0) {
-        for (const flag of result.flags) {
-          // Try to find the actual timestamp of the quote in the transcript
-          let flagStartTime = startTime;
-          if (flag.quote) {
-            const foundTime = this.findPhraseTimestamp(flag.quote, chapterSegments);
-            if (foundTime !== null) {
-              flagStartTime = foundTime;
-            } else {
-              // Quote not found - log for debugging
-              this.logger.debug(`[Pass 2] Quote not found in transcript: "${flag.quote.substring(0, 80)}..."`);
-            }
-          } else {
-            this.logger.debug(`[Pass 2] Flag has no quote field: ${JSON.stringify(flag)}`);
-          }
+      this.logger.debug(`[Pass 2] Chapter ${i + 1}: "${result.title.substring(0, 50)}..."`);
+    }
 
-          // Build description: prefer quote (verbatim text), fall back to description
-          // If both exist, show quote first with reason after
-          let displayDescription = flag.description || '';
-          if (flag.quote) {
-            if (flag.description) {
-              displayDescription = `"${flag.quote}" — ${flag.description}`;
-            } else {
-              displayDescription = `"${flag.quote}"`;
-            }
-          }
 
-          allFlags.push({
-            category: flag.category,
-            description: displayDescription,
-            start_time: this.formatDisplayTime(flagStartTime),
-            end_time: this.formatDisplayTime(Math.min(flagStartTime + 30, endTime)), // ~30 sec duration
-            quotes: flag.quote
-              ? [
-                  {
-                    timestamp: this.formatDisplayTime(flagStartTime),
-                    text: flag.quote,
-                    significance: flag.description,
-                  },
-                ]
-              : [],
-          });
+    // =========================================================================
+    // PASS 2b: flag extraction for every chapter, as its own phase.
+    //
+    // Kept separate from the chapter loop so all chapter work finishes before
+    // any flag work starts. Flag extraction reads the same truncated chapter
+    // text and never the chapter's title/summary, so the two are independent and
+    // safe to separate — and separating them means each model loads once even
+    // when 'flags' is routed to a different model than 'chapter'.
+    // =========================================================================
+    if (pendingFlagWork.length > 0) {
+      const flagConfig = this.resolveTaskConfig(config, 'flags', taskModels);
+      this.logger.log(
+        `[Pass 2b] Extracting flags for ${pendingFlagWork.length} chapters on ${flagConfig.provider}:${flagConfig.model} ` +
+        `(concurrency ${Math.min(FLAG_EXTRACTION_CONCURRENCY, pendingFlagWork.length)})`,
+      );
+
+      // Extract concurrently, but WRITE results in chapter order below: flags are
+      // rendered on a timeline, so interleaving them by completion order would
+      // scramble the output for no benefit.
+      const extracted: ChapterFlag[][] = new Array(pendingFlagWork.length);
+      let nextWorkIndex = 0;
+      let completedFlagChapters = 0;
+
+      const runWorker = async (): Promise<void> => {
+        for (;;) {
+          const slot = nextWorkIndex++;
+          if (slot >= pendingFlagWork.length) return;
+          const work = pendingFlagWork[slot];
+          // extractChapterFlags never throws — a failed chapter yields [] and is
+          // counted via recordFailure — so one bad chapter cannot abort the pool.
+          extracted[slot] = await this.extractChapterFlags(
+            flagConfig,
+            work.truncatedText,
+            videoTitle,
+            categories,
+            work.chapterNumber,
+            analysisGranularity,
+            customInstructions,
+            onTokens,
+            recordFailure,
+          );
+          completedFlagChapters++;
+          onFlagProgress?.(completedFlagChapters, pendingFlagWork.length);
         }
-      }
+      };
 
-      this.logger.debug(`[Pass 2] Chapter ${i + 1}: "${result.title.substring(0, 50)}..." (${result.flags?.length || 0} flags)`);
+      await Promise.all(
+        Array.from(
+          { length: Math.min(FLAG_EXTRACTION_CONCURRENCY, pendingFlagWork.length) },
+          () => runWorker(),
+        ),
+      );
+
+      for (let slot = 0; slot < pendingFlagWork.length; slot++) {
+        const work = pendingFlagWork[slot];
+        const { chapterNumber, chapterSegments, startTime, endTime } = work;
+        const flags = extracted[slot] ?? [];
+
+        // Convert flags to AnalyzedSection format - pass through without filtering
+        if (flags.length > 0) {
+          for (const flag of flags) {
+            // Try to find the actual timestamp of the quote in the transcript
+            let flagStartTime = startTime;
+            if (flag.quote) {
+              const foundTime = this.findPhraseTimestamp(flag.quote, chapterSegments);
+              if (foundTime !== null) {
+                flagStartTime = foundTime;
+              } else {
+                // Quote not found - log for debugging
+                this.logger.debug(`[Pass 2b] Quote not found in transcript: "${flag.quote.substring(0, 80)}..."`);
+              }
+            } else {
+              this.logger.debug(`[Pass 2b] Flag has no quote field: ${JSON.stringify(flag)}`);
+            }
+
+            // Build description: prefer quote (verbatim text), fall back to description
+            // If both exist, show quote first with reason after
+            let displayDescription = flag.description || '';
+            if (flag.quote) {
+              if (flag.description) {
+                displayDescription = `"${flag.quote}" — ${flag.description}`;
+              } else {
+                displayDescription = `"${flag.quote}"`;
+              }
+            }
+
+            allFlags.push({
+              category: flag.category,
+              description: displayDescription,
+              start_time: this.formatDisplayTime(flagStartTime),
+              end_time: this.formatDisplayTime(Math.min(flagStartTime + 30, endTime)), // ~30 sec duration
+              quotes: flag.quote
+                ? [
+                    {
+                      timestamp: this.formatDisplayTime(flagStartTime),
+                      text: flag.quote,
+                      significance: flag.description,
+                    },
+                  ]
+                : [],
+            });
+          }
+        }
+        this.logger.debug(`[Pass 2b] Chapter ${chapterNumber}: ${flags.length} flags`);
+      }
     }
 
     // Deduplicate flags with the same or very close timestamps (within 5 seconds)

@@ -611,7 +611,7 @@ export class LibraryService {
             aiModel,
             aiProvider,
             customInstructions: config?.customInstructions || '',
-            analysisGranularity: config?.analysisGranularity ?? 5,
+            analysisGranularity: config?.analysisGranularity ?? 2,
             analysisQuality: config?.analysisQuality || 'fast'
           }
         }];

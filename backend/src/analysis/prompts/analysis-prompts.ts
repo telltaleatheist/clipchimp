@@ -221,47 +221,69 @@ ${chunkText}`;
 // optionally detects category flags within the chapter's content.
 
 /**
- * Map the user's 1-10 sensitivity slider onto a single, mechanical flagging
- * threshold line.
+ * Coerce a stored sensitivity value onto the 1-3 scale.
  *
- * This ONLY moves the confidence bar for what counts as a match — it never
- * relaxes the PROMOTING-vs-DEBUNKING guard, and even at the top of the range it
- * still requires the speaker to actually assert the thing (no dog-whistle /
- * subtext / "reminds me of a category" flagging, which destroys precision on a
- * 14B-class model and self-flags counter-apologetics content). The old 1-10
- * escalation that told the model to "flag ANYTHING tenuous" and "create
- * categories freely" was removed for exactly that reason.
- *
- * @param granularity - 1 (strict) to 10 (broad); default handled by the caller.
+ * The dial used to be 1-10 (<=3 strict, <=7 balanced, >7 broad). A value above
+ * 3 can only have come from that old scale, so it is mapped onto the bucket it
+ * used to select. Values of 1-3 are ambiguous between the two scales and are
+ * read as the NEW scale — the practical cost is that a legacy "3" (strict) now
+ * reads as "aggressive", which surfaces extra flags for review rather than
+ * silently hiding any. Erring toward recall is the right failure direction here.
  */
-function getSensitivityLine(granularity: number): string {
-  if (granularity <= 3) {
-    return 'Sensitivity: strict. Flag only clear, explicit matches you are confident about. When unsure, do not flag.';
-  } else if (granularity <= 7) {
-    return 'Sensitivity: balanced. Flag clear matches and reasonably likely ones; skip vague or tangential cases.';
-  }
-  return 'Sensitivity: broad. Flag clear and borderline matches, but the speaker must still be asserting the thing itself — never flag a mere mention, a criticism, or an implication.';
+export function normalizeSensitivity(value: number | undefined | null): 1 | 2 | 3 {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 2;
+  if (value > 3) return value <= 7 ? 2 : 3; // legacy 1-10 value
+  const rounded = Math.round(value);
+  return (rounded < 1 ? 1 : rounded > 3 ? 3 : rounded) as 1 | 2 | 3;
 }
 
+/**
+ * Map the 1-3 sensitivity dial onto a flagging-threshold block.
+ *
+ * The PROMOTING-vs-DEBUNKING guard is deliberately NOT part of this scale — it
+ * lives in the flag rulebook and applies identically at every level, because a
+ * speaker who debunks a claim must never be flagged for it no matter how far up
+ * the dial goes. What this scale moves is the confidence bar and how exhaustive
+ * the model is told to be.
+ *
+ *   1 - strong matches only: explicit and unmistakable. Precision over recall.
+ *   2 - balanced (default): clear matches plus reasonably likely ones.
+ *   3 - aggressive: everything that could match, including implication and
+ *       euphemism, with an explicit instruction to be exhaustive rather than
+ *       selective. Recall over precision, on the assumption that a human
+ *       reviews every flag and would rather discard a few than miss one.
+ */
+function getSensitivityLine(sensitivity: number): string {
+  switch (normalizeSensitivity(sensitivity)) {
+    case 1:
+      return 'Sensitivity: strong matches only. Flag a quote only when it is an explicit, unmistakable instance of the category. When unsure, do not flag.';
+    case 3:
+      return `Sensitivity: AGGRESSIVE. Find everything that could match a category.
+- Be exhaustive, not selective. List every qualifying quote in the chapter even if there are many; do not stop at the most obvious two or three, and never merge several separate moments into one flag.
+- Include borderline cases, euphemism, coded language, and claims advanced by implication rather than stated outright. If a reviewer would plausibly want to see it, flag it.
+- Recall matters more than precision at this setting. A human reviews every flag and can discard the weak ones; a missed quote is the expensive error.
+- This does NOT relax the test above. The speaker must still be advancing the claim rather than debunking it, and the quote must still be verbatim.`;
+    default:
+      return 'Sensitivity: balanced. Flag clear matches and reasonably likely ones; skip vague or tangential cases.';
+  }
+}
+
+/**
+ * Chapter titling and summarization ONLY.
+ *
+ * Category flagging deliberately does NOT live here. It used to be a third
+ * field on this prompt's JSON, which meant the model split its budget three
+ * ways and treated `flags` as an afterthought — it reliably returned two or
+ * three obvious quotes per chapter and stopped. Flagging now gets its own
+ * dedicated call (buildFlagExtractionPrompt) whose only job is extraction.
+ */
 export function buildChapterAnalysisPrompt(
   videoTitle: string,
   chapterText: string,
-  categories: AnalysisCategory[],
   chapterNumber: number,
   previousChapterSummary?: string,
   customInstructions?: string,
-  analysisGranularity?: number,
 ): string {
-  // Only include category instructions if categories exist and are enabled
-  const enabledCategories = categories?.filter((c) => c.enabled !== false) || [];
-  const hasCategories = enabledCategories.length > 0;
-
-  const categoryList = enabledCategories
-    .map((c) => `- ${c.name}: ${c.description}`)
-    .join('\n');
-
-  const firstCategory = hasCategories ? enabledCategories[0].name : 'hate';
-
   const prevContext = previousChapterSummary
     ? `Previous chapter: "${previousChapterSummary}"\n`
     : '';
@@ -270,24 +292,62 @@ export function buildChapterAnalysisPrompt(
     ? `Viewer context: ${customInstructions}\n`
     : '';
 
-  // Map the 1-10 slider (default 5 = balanced) onto a single threshold line.
-  const granularity = analysisGranularity ?? 5;
-  const sensitivityLine = getSensitivityLine(granularity);
+  return `Label chapter ${chapterNumber} of a video transcript. Output JSON only.
+Video: ${videoTitle}
+${prevContext}${customContext}
+Produce:
+- title: one sentence (max ~15 words) naming what this chapter is about.
+- summary: 2-3 sentences on what the speaker actually says.
 
-  // The flags field in the output-shape example (only when categories exist).
-  const flagsField = hasCategories
-    ? `,\n  "flags": [{"category": "${firstCategory}", "description": "why the quote matches", "quote": "exact words from the transcript"}]`
+Output exactly this shape and nothing else:
+{
+  "title": "...",
+  "summary": "..."
+}
+
+TRANSCRIPT:
+${chapterText}`;
+}
+
+/**
+ * Dedicated category-flag extraction for a single chapter.
+ *
+ * This is a separate call from chapter titling so the model's whole attention
+ * goes to finding matches. The debunking-vs-promoting guard leads the prompt
+ * because it is the #1 correctness axis for this counter-apologetics use case:
+ * the operator's own commentary must never flag itself for quoting the thing
+ * it is criticizing.
+ */
+export function buildFlagExtractionPrompt(
+  videoTitle: string,
+  chapterText: string,
+  categories: AnalysisCategory[],
+  chapterNumber: number,
+  sensitivity?: number,
+  customInstructions?: string,
+): string {
+  const enabledCategories = categories?.filter((c) => c.enabled !== false) || [];
+
+  const categoryList = enabledCategories
+    .map((c) => `- ${c.name}: ${c.description}`)
+    .join('\n');
+
+  const firstCategory = enabledCategories[0]?.name ?? 'hate';
+
+  const customContext = customInstructions
+    ? `Viewer context: ${customInstructions}\n`
     : '';
 
-  // The bullet in the "Produce" list.
-  const flagsListItem = hasCategories
-    ? '\n- flags: quotes matching a category below; use [] when none match.'
-    : '';
+  const sensitivityLine = getSensitivityLine(sensitivity ?? 2);
 
-  // The full flagging rulebook — the debunking-vs-promoting guard is the #1
-  // correctness axis for this counter-apologetics use case, so it leads.
-  const flagsBlock = hasCategories
-    ? `
+  return `Find every quote in chapter ${chapterNumber} of this transcript that matches one of the categories below. Output JSON only.
+Video: ${videoTitle}
+${customContext}
+Output exactly this shape and nothing else:
+{
+  "flags": [{"category": "${firstCategory}", "description": "why the quote matches", "quote": "exact words from the transcript"}]
+}
+Use {"flags": []} when nothing matches.
 
 THE TEST FOR EVERY FLAG — is the speaker SAYING THIS IS TRUE, or SAYING IT IS FALSE?
 Flag ONLY when the speaker asserts, promotes, defends, or urges the claim.
@@ -306,21 +366,7 @@ Flagging rules:
 - One quote, one flag, one category. Choose the single best fit; never merge two names (not "hate-conspiracy"). If nothing fits but it clearly qualifies, coin a new lowercase-dashed name.
 - description = one sentence on why it matches, and it must describe the speaker ENDORSING the claim.
 
-${sensitivityLine}`
-    : '';
-
-  return `Label chapter ${chapterNumber} of a video transcript. Output JSON only.
-Video: ${videoTitle}
-${prevContext}${customContext}
-Produce:
-- title: one sentence (max ~15 words) naming what this chapter is about.
-- summary: 2-3 sentences on what the speaker actually says.${flagsListItem}
-
-Output exactly this shape and nothing else:
-{
-  "title": "...",
-  "summary": "..."${flagsField}
-}${flagsBlock}
+${sensitivityLine}
 
 TRANSCRIPT:
 ${chapterText}`;

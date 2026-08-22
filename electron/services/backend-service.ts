@@ -557,7 +557,13 @@ export class BackendService {
         // Try graceful shutdown first
         this.backendProcess.kill('SIGTERM');
 
-        // Wait for graceful shutdown (up to 2 seconds)
+        // Wait for graceful shutdown (up to 6 seconds).
+        //
+        // Raised from 2s: the backend now uses SIGTERM to cancel in-flight
+        // Ollama generations and unload the models it loaded, which frees
+        // 17-25GB of VRAM on quit. That needs more than 2s of headroom, and the
+        // process still exits as soon as it is done — this is only a ceiling,
+        // not a delay. The SIGKILL fallback still guarantees we exit.
         await new Promise<void>((resolve) => {
           const timeout = setTimeout(() => {
             if (this.backendProcess && !this.backendProcess.killed) {
@@ -565,7 +571,7 @@ export class BackendService {
               this.backendProcess.kill('SIGKILL');
             }
             resolve();
-          }, 2000);
+          }, 6000);
 
           if (this.backendProcess) {
             this.backendProcess.once('exit', () => {

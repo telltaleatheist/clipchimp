@@ -61,7 +61,12 @@ export class QueueManagerService implements OnModuleDestroy, OnModuleInit {
   // Watchdog timer for detecting stuck tasks
   private watchdogInterval: NodeJS.Timeout | null = null;
   private readonly WATCHDOG_INTERVAL_MS = 60000;  // Check every minute
-  private readonly AI_TASK_TIMEOUT_MS = 30 * 60 * 1000;  // 30 minutes for AI tasks
+  // 90 minutes. Sized from measured qwen3.8:27b rates (~220s per flag-extraction
+  // call, ~40s per chapter): a 60-minute video projects to ~57min, leaving almost
+  // no margin at 60. The asymmetry justifies the headroom — a run that finishes
+  // early costs nothing, while a premature kill destroys the whole analysis,
+  // since results are only persisted at finalize.
+  private readonly AI_TASK_TIMEOUT_MS = 90 * 60 * 1000;  // 90 minutes for AI tasks
   // Main-pool tasks are killed on a STALL, not on total runtime. A wall-clock
   // cap can't distinguish a wedged task from a healthy slow one, and legitimate
   // work routinely runs past any cap worth setting: a 2.5-hour broadcast is a

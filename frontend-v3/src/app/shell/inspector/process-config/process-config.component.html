@@ -196,12 +196,12 @@
                     type="range"
                     class="opt-slider"
                     min="1"
-                    max="10"
+                    max="3"
                     step="1"
                     [disabled]="granularityLoading()"
                     [value]="granularityValue()"
                     (input)="onGranularityInput($event)"
-                    aria-label="Detection sensitivity, 1 strict to 10 aggressive" />
+                    aria-label="Detection sensitivity, 1 strong matches only to 3 aggressive" />
                   <span class="opt-hint">{{ granularityDescription() }}</span>
                   @if (granularityError()) {
                     <div class="opt-error">

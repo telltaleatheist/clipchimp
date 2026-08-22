@@ -57,7 +57,7 @@ export const PIPELINE_STEPS: {
     type: 'ai-analyze',
     label: 'AI Analyze',
     description: 'Sections & flags via your default AI model',
-    defaultConfig: { analysisGranularity: 5, customInstructions: '', aiModel: '' },
+    defaultConfig: { analysisGranularity: 2, customInstructions: '', aiModel: '' },
   },
 ];
 
@@ -77,7 +77,7 @@ const STARTER_PRESETS: PipelinePreset[] = [
     name: 'Transcribe + Analyze',
     steps: [
       { type: 'transcribe', config: { model: 'base', language: 'en', translate: false } },
-      { type: 'ai-analyze', config: { analysisGranularity: 5, customInstructions: '', aiModel: '' } },
+      { type: 'ai-analyze', config: { analysisGranularity: 2, customInstructions: '', aiModel: '' } },
     ],
   },
   {

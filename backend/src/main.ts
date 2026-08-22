@@ -8,6 +8,7 @@ import { log } from './common/logger';
 import { ServerOptions } from 'socket.io';
 import * as express from 'express';  // Explicitly import express
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+import { AIProviderService } from './analysis/ai-provider.service';
 
 class ExtendedIoAdapter extends IoAdapter {
   createIOServer(port: number, options?: ServerOptions): any {
@@ -90,6 +91,41 @@ async function bootstrap() {
     // LAN mode is explicitly opted in (BRIEFCASE_LAN=1). host resolves in
     // config/environment.ts.
     const host = environment.host;
+
+    // Graceful shutdown. The Electron parent sends SIGTERM and waits before
+    // force-killing; without a handler here the backend was ALWAYS force-killed,
+    // so nothing ever got a chance to clean up — most visibly, Ollama models
+    // stayed resident (17-25GB) after quitting until keep_alive expired.
+    app.enableShutdownHooks();
+
+    let shuttingDown = false;
+    const gracefulShutdown = async (signal: string) => {
+      if (shuttingDown) return; // several paths can fire; run once
+      shuttingDown = true;
+      log.info(`Received ${signal} — releasing resources before exit...`);
+      try {
+        // Release Ollama models we loaded. Bounded so a hung daemon cannot keep
+        // us past the parent's grace period; we get force-killed either way.
+        const aiProvider = app.get(AIProviderService, { strict: false });
+        await Promise.race([
+          aiProvider.releaseOllamaModels(),
+          new Promise((resolve) => setTimeout(resolve, 3000)),
+        ]);
+      } catch (error) {
+        log.warn(`Error releasing Ollama models: ${(error as Error).message}`);
+      }
+      try {
+        await app.close();
+      } catch (error) {
+        log.warn(`Error closing Nest application: ${(error as Error).message}`);
+      }
+      log.info('Graceful shutdown complete');
+      process.exit(0);
+    };
+
+    process.on('SIGTERM', () => void gracefulShutdown('SIGTERM'));
+    process.on('SIGINT', () => void gracefulShutdown('SIGINT'));
+
     await app.listen(port, host);
     log.info(`=== APPLICATION STARTED ===`);
     log.info(`Server running on ${host}:${port}${environment.lanMode ? ' (LAN mode — no auth)' : ' (loopback only)'}`);

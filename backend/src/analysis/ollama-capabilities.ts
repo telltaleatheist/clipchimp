@@ -19,6 +19,24 @@
  * fails loudly rather than silently guessing.
  */
 
+import { AITaskKind, ThinkLevel, thinkingForTask, thinkLevelForTask } from './model-utils';
+
+/**
+ * Models that rejected a graded think level ("low"/"medium"/"high") and must be
+ * sent plain `think: true` instead. Populated at first failure by the caller —
+ * Ollama's `--think` help says levels apply only "for supported models", and
+ * there is no capability flag advertising which.
+ */
+const gradedThinkUnsupported = new Set<string>();
+
+/** Record that `model` cannot take graded levels, so we stop sending them. */
+export function markGradedThinkUnsupported(baseUrl: string, model: string): void {
+  if (!gradedThinkUnsupported.has(`${baseUrl}::${model}`)) {
+    console.log(`[OLLAMA-CAPS] ${model} rejected a graded think level — falling back to think:true`);
+  }
+  gradedThinkUnsupported.add(`${baseUrl}::${model}`);
+}
+
 // Cache successful probes; a failed probe is dropped so the next call retries.
 const thinkingCapabilityCache = new Map<string, Promise<boolean>>();
 
@@ -60,21 +78,48 @@ export async function ollamaModelSupportsThinking(baseUrl: string, model: string
 
 export interface OllamaThinkNegotiation {
   /** Top-level fields to merge into the /api/generate body. */
-  fields: { think?: true };
+  fields: { think?: boolean | ThinkLevel };
   /** True when the model is thinking-capable (caller sizes num_predict up). */
   thinking: boolean;
+  /** The graded level requested, or null when sending plain `think: true`. */
+  level: ThinkLevel | null;
 }
 
 /**
- * Negotiate the `think` request field. Analysis enables thinking, so
- * thinking-capable models get `{ think: true }` and non-thinking models get
- * `{}`. Also returns the `thinking` flag so the caller can size num_predict and
+ * Negotiate the `think` request field for one task.
+ *
+ * Two gates, both of which must pass before a model is asked to reason:
+ *   1. the TASK must benefit from it (thinkingForTask) — thinking costs ~1,900+
+ *      output tokens a call and generation time tracks output tokens, so
+ *      mechanical tasks skip it outright and never even probe;
+ *   2. the MODEL must report the 'thinking' capability, since sending `think`
+ *      to a model without it does nothing.
+ *
+ * Also returns the `thinking` flag so the caller can size num_predict and
  * num_ctx to leave room for the chain of thought.
  */
 export async function negotiateOllamaThink(
   baseUrl: string,
   model: string,
+  task?: AITaskKind,
 ): Promise<OllamaThinkNegotiation> {
+  if (!thinkingForTask(task)) {
+    return { fields: {}, thinking: false, level: null };
+  }
+
   const thinking = await ollamaModelSupportsThinking(baseUrl, model);
-  return { fields: thinking ? { think: true } : {}, thinking };
+  if (!thinking) {
+    return { fields: {}, thinking: false, level: null };
+  }
+
+  // Graded levels cut reasoning tokens (the dominant cost) WITHOUT relocating
+  // the reasoning into `response` the way `think: false` does. Fall back to
+  // plain `think: true` for models known to reject them.
+  if (gradedThinkUnsupported.has(`${baseUrl}::${model}`)) {
+    return { fields: { think: true }, thinking: true, level: null };
+  }
+
+  const level = thinkLevelForTask(task);
+  return { fields: { think: level }, thinking: true, level };
 }
+

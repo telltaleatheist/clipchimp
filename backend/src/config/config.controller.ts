@@ -3,7 +3,7 @@ import { SharedConfigService } from './shared-config.service';
 import { ApiKeysService } from './api-keys.service';
 import { ModelManagerService } from './model-manager.service';
 import { LlamaManager } from '../bridges';
-import { DEFAULT_PROMPTS, DEFAULT_CATEGORIES } from '../analysis/prompts/analysis-prompts';
+import { DEFAULT_PROMPTS, DEFAULT_CATEGORIES, normalizeSensitivity } from '../analysis/prompts/analysis-prompts';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -362,8 +362,8 @@ export class ConfigController implements OnModuleInit {
         config = JSON.parse(configData);
       }
 
-      // Update default granularity (clamp to 1-10)
-      const granularity = Math.max(1, Math.min(10, body.granularity));
+      // Update default sensitivity (clamp to the 1-3 scale)
+      const granularity = normalizeSensitivity(body.granularity);
       config.defaultGranularity = granularity;
       config.lastUpdated = new Date().toISOString();
 
@@ -395,19 +395,20 @@ export class ConfigController implements OnModuleInit {
 
         return {
           success: true,
-          granularity: config.defaultGranularity ?? 5 // Default to 5 (balanced) if not set
+          // normalizeSensitivity also migrates legacy 1-10 values on read.
+          granularity: normalizeSensitivity(config.defaultGranularity)
         };
       }
 
       return {
         success: true,
-        granularity: 5 // Default to balanced
+        granularity: 2 // Default to balanced
       };
     } catch (error: any) {
       return {
         success: false,
         message: `Failed to get default granularity: ${(error as Error).message}`,
-        granularity: 5
+        granularity: 2
       };
     }
   }

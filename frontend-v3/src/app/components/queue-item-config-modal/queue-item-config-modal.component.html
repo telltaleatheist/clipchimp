@@ -170,16 +170,16 @@
               <div class="form-group granularity-group">
                 <div class="label-row">
                   <label>Detection Sensitivity</label>
-                  <span class="granularity-value">{{ getGranularityLabel(getTaskConfig(task.type).analysisGranularity || 5) }}</span>
+                  <span class="granularity-value">{{ getGranularityLabel(getTaskConfig(task.type).analysisGranularity || 2) }}</span>
                 </div>
                 <div class="slider-container">
-                  <span class="slider-label-left">Strict</span>
+                  <span class="slider-label-left">Strong only</span>
                   <input
                     type="range"
                     min="1"
-                    max="10"
+                    max="3"
                     step="1"
-                    [value]="getTaskConfig(task.type).analysisGranularity || 5"
+                    [value]="getTaskConfig(task.type).analysisGranularity || 2"
                     (input)="updateTaskConfig(task.type, { analysisGranularity: +$any($event.target).value })"
                     (change)="onGranularityChange(+$any($event.target).value)"
                     class="granularity-slider"
@@ -187,7 +187,7 @@
                   <span class="slider-label-right">Aggressive</span>
                 </div>
                 <div class="granularity-description">
-                  {{ getGranularityDescription(getTaskConfig(task.type).analysisGranularity || 5) }}
+                  {{ getGranularityDescription(getTaskConfig(task.type).analysisGranularity || 2) }}
                 </div>
               </div>
 

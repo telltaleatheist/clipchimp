@@ -1397,7 +1397,7 @@ export class QueueService implements OnDestroy {
             aiModel,
             aiProvider,
             customInstructions: analyzeTask.options?.['customInstructions'],
-            analysisGranularity: analyzeTask.options?.['analysisGranularity'] ?? 5,
+            analysisGranularity: analyzeTask.options?.['analysisGranularity'] ?? 2,
             analysisQuality: analyzeTask.options?.['analysisQuality'] || 'fast'
           }
         });

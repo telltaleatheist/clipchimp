@@ -61,7 +61,7 @@ export function parseProviderModel(
  * decoding (low temperature) so the output parses; free-text tasks tolerate a
  * little variety.
  */
-export type AITaskKind = 'boundary' | 'chapter' | 'tags' | 'description' | 'title';
+export type AITaskKind = 'boundary' | 'chapter' | 'flags' | 'tags' | 'description' | 'title';
 
 /**
  * Sampling temperature per task.
@@ -75,6 +75,7 @@ export function temperatureForTask(kind?: AITaskKind): number {
   switch (kind) {
     case 'boundary':
     case 'chapter':
+    case 'flags':
     case 'tags':
       return 0.15;
     case 'description':
@@ -85,6 +86,75 @@ export function temperatureForTask(kind?: AITaskKind): number {
       return 0.2;
   }
 }
+
+/**
+ * Whether a task should ask a thinking-capable model to reason before answering.
+ *
+ * Thinking is NOT free — measured on qwen3.8:27b, a thinking call emits roughly
+ * 1,900-2,900 output tokens regardless of how small the real answer is, and
+ * generation time is dominated by output tokens. It is therefore spent only
+ * where deliberation changes the answer:
+ *
+ *  - flags:    the assert-vs-debunk test is a genuine judgment call and BOTH
+ *              failure directions are expensive (a false accusation, or a missed
+ *              quote). This is what chain-of-thought is actually for.
+ *  - chapter:  working out what a chapter is about before summarizing it. Cheap
+ *              in practice — measured at ~520 output tokens.
+ *
+ * Everything else is mechanical and pays the full thinking tax for nothing:
+ *  - boundary: copies 3-8 word phrases and judges subject changes, but the
+ *              downstream force-split at maxChapterSeconds bounds chapter length
+ *              anyway, so ~1,900 tokens of deliberation buys very little.
+ *  - tags / description / title: format transforms over already-summarized
+ *              chapters. A prior run spent ~1,000 reasoning tokens writing a
+ *              filename.
+ */
+export function thinkingForTask(_kind?: AITaskKind): boolean {
+  // ALWAYS TRUE — thinking stays ENABLED. Do not switch this to `think: false`.
+  //
+  // Measured on Ollama 0.32.14 with qwen3-class models:
+  //   think omitted -> thinking still happens (omission means "default" = on).
+  //   think: false  -> the model does NOT stop reasoning, it RELOCATES the
+  //                    reasoning into `response`, polluting it with prose and
+  //                    breaking JSON parsing. eval_count went UP, not down.
+  //
+  // The lever that DOES work is the graded level below (think: "low"), which
+  // keeps reasoning in the separate `thinking` field but spends less on it.
+  return true;
+}
+
+/** Graded reasoning effort. Ollama accepts true/false or high/medium/low. */
+export type ThinkLevel = 'low' | 'medium' | 'high';
+
+/**
+ * How much reasoning each task gets.
+ *
+ * Generation time is output tokens / tokens-per-second, and on a 27B this
+ * machine runs ~15-18 tok/s. Thinking dominates that budget: a flag call
+ * measured 3,433 output tokens for ~300 tokens of actual JSON, i.e. ~200s of
+ * which ~185s was reasoning. Turning the level down is the only lever that
+ * reduces reasoning WITHOUT pushing it into the answer.
+ *
+ * EVERYTHING starts at 'low', including flags. The intuition that flag
+ * extraction needs deliberation for the assert-vs-debunk test is plausible but
+ * UNVERIFIED, and flags are ~50% of total runtime — so it is the most expensive
+ * place to hold an untested assumption. There is now a hand-built reference set
+ * of flaggable moments for a known video, which makes this measurable: run at
+ * 'low', score against the reference, and raise ONLY the task whose quality
+ * actually drops.
+ *
+ * Raise flags to 'medium'/'high' first if recall regresses; leave the mechanical
+ * tasks (boundary copying, chapter summarizing, metadata formatting) at 'low'
+ * regardless — they were burning 1,500-7,400 reasoning tokens on work needing
+ * almost none.
+ *
+ * Levels are advisory: models that do not implement them fall back to plain
+ * `think: true` (see ollama-capabilities).
+ */
+export function thinkLevelForTask(_kind?: AITaskKind): ThinkLevel {
+  return 'low';
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Ollama num_ctx sizing (ported from BookForge electron/ai-bridge.ts)
