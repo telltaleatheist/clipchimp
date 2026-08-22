@@ -5,6 +5,8 @@ import { SimpleTranscribeController } from './simple-transcribe.controller';
 import { OllamaService } from './ollama.service';
 import { AIProviderService } from './ai-provider.service';
 import { AIAnalysisService } from './ai-analysis.service';
+import { ChapterDetectionService } from './chapter-detection.service';
+import { NliRankerService } from './nli-ranker.service';
 import { LlamaManager } from '../bridges';
 import { FfmpegModule } from '../ffmpeg/ffmpeg.module';
 import { DownloaderModule } from '../downloader/downloader.module';
@@ -32,7 +34,7 @@ import { ApiKeysModule } from '../config/config.module';
     AnalysisController,
     SimpleTranscribeController,
   ],
-  providers: [AnalysisService, OllamaService, AIProviderService, AIAnalysisService, LlamaManager],
-  exports: [AnalysisService, OllamaService, AIProviderService, AIAnalysisService, LlamaManager],
+  providers: [AnalysisService, OllamaService, AIProviderService, AIAnalysisService, ChapterDetectionService, NliRankerService, LlamaManager],
+  exports: [AnalysisService, OllamaService, AIProviderService, AIAnalysisService, ChapterDetectionService, NliRankerService, LlamaManager],
 })
 export class AnalysisModule {}

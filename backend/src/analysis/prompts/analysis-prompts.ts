@@ -162,56 +162,53 @@ export const QUOTE_EXTRACTION_PROMPT = DEFAULT_QUOTE_PROMPT;
 // =============================================================================
 
 // -----------------------------------------------------------------------------
-// PASS 1: Boundary Detection Prompt
+// PASS 1: Boundary Placement Prompt
 // -----------------------------------------------------------------------------
-// Lightweight prompt for detecting topic changes in a transcript chunk.
-// Used to find chapter boundaries without full analysis.
+// Pass 1 no longer asks a model WHERE the chapters are — that prompt is gone.
+// Asking for "all the boundaries in this 15-minute chunk" reliably returned a
+// PREFIX of them (1-3) and stopped, which is how a 27:00 ad break went missing
+// on a 63-minute video. Boundaries are now SCORED from embedding cohesion
+// (chapter-detection.service), and the model's only job is the one thing code
+// cannot do: read the ~90 seconds around an already-chosen junction and say
+// which sentence the new subject starts on.
+//
+// The model NEVER emits a timestamp. It quotes a verbatim sentence and
+// findPhraseTimestamp maps that quote to seconds — an invented timestamp is a
+// guess, a mapped quote is a measurement.
 
-export function buildBoundaryDetectionPrompt(
-  videoTitle: string,
-  chunkText: string,
-  previousTopic: string,
-  isFirstChunk: boolean,
-  videoDurationSeconds?: number,
+/**
+ * Ask for the first sentence of the NEW subject inside one ~90s window.
+ *
+ * The "turn, not arrival" ordering is load-bearing: an earlier version of this
+ * prompt that rejected the sentence which merely hints at what is coming placed
+ * boundaries ~12s LATE, because the hint IS where a human puts the mark.
+ */
+export function buildBoundaryPlacementPrompt(
+  windowText: string,
+  videoTitle?: string,
 ): string {
   const titleContext = videoTitle ? `Video: ${videoTitle}\n` : '';
-  const prevContext = previousTopic
-    ? `Prior section ended on: "${previousTopic}"\n`
-    : '';
 
-  // Format duration for display
-  let durationContext = '';
-  let shortVideoGuidance = '';
-  if (videoDurationSeconds !== undefined) {
-    const minutes = Math.floor(videoDurationSeconds / 60);
-    const seconds = Math.floor(videoDurationSeconds % 60);
-    const durationStr = minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
-    durationContext = `Duration: ${durationStr}\n`;
+  return `Below is one stretch of a video transcript. Somewhere inside it the speaker moves from one subject to the next.
+${titleContext}
+TRANSCRIPT:
+${windowText}
 
-    // Add guidance for short videos (under 3 minutes)
-    if (videoDurationSeconds < 180) {
-      shortVideoGuidance =
-        '- Short clip: it likely covers ONE subject. Mark a boundary only for a genuinely different subject.\n';
-    }
-  }
+Find where the handover BEGINS — the first sentence a viewer would want to land on if they clicked a chapter marker here.
 
-  const firstChunkLine = isFirstChunk
-    ? '- Do not mark the very first words — chapter 1 already starts at 0:00.\n'
-    : '';
+That is the sentence where the speaker TURNS AWAY from the old subject, which is usually a beat EARLIER than the sentence that first explains the new one. If the speaker says "anyway, let's talk about X" and then explains X three sentences later, the turn is "anyway, let's talk about X" — quote that, not the explanation. A viewer dropped at the explanation has already missed the start.
 
-  return `Find where the SUBJECT changes in this transcript. Output JSON only.
-${titleContext}${durationContext}${prevContext}
-A boundary is where the speaker turns to a clearly different subject — not a new example, tangent, or angle on the same subject.
-- Copy the exact 3-8 word phrase from the transcript where the new subject begins.
-${shortVideoGuidance}${firstChunkLine}- Also note, in a few words, what the transcript is discussing at its end.
+Prefer, in this order:
+1. the sentence where the speaker announces, introduces or turns toward the new subject
+2. the sentence where the speaker closes off the old subject, if the turn is not announced
+3. the first sentence that is plainly about the new subject, if there is no turn at all
+
+If the transcript contains MORE THAN ONE subject change, pick the one nearest the MIDDLE of the excerpt — the excerpt is centered on the boundary being placed, so changes near its edges belong to neighboring chapters, not this one.
+
+Copy the sentence EXACTLY as it appears above, word for word, at least six words, no timestamps and no tidying up. That quote is what fixes the chapter's start time to the second, so a quote you reworded points at the wrong moment.
 
 Output exactly this shape and nothing else:
-{"boundaries": ["exact phrase where the next subject begins"], "end_topic": "what it is discussing at the end"}
-
-If the subject never changes, output: {"boundaries": [], "end_topic": "..."}
-
-Transcript:
-${chunkText}`;
+{"quote": "<exact sentence from the transcript above>"}`;
 }
 
 // -----------------------------------------------------------------------------
@@ -372,17 +369,135 @@ TRANSCRIPT:
 ${chapterText}`;
 }
 
+/**
+ * Verify ONE ranked candidate: does the marked sentence ASSERT the category's
+ * proposition, or merely report/question/argue against it?
+ *
+ * This is the second half of the measured flag pipeline (see
+ * nli-ranker.service.ts). The NLI ranker cannot tell stance apart — "these
+ * candidates are communists" and "Republicans have been eager to paint them as
+ * communists" both score ~0.98 on the same hypothesis — so every candidate it
+ * produces gets exactly one question asked about it here.
+ *
+ * WHAT THIS PROMPT DELIBERATELY DOES NOT CONTAIN, per the hygiene ruling in
+ * docs/youtube-metadata-spec.md §6.1: no incorrect examples, no ban lists.
+ * Both verdicts are DEFINED positively — what earns "flag", what earns "skip" —
+ * rather than illustrated with a wrong answer the model might copy.
+ *
+ * It keeps the spirit of buildFlagExtractionPrompt's promoting-vs-debunking
+ * guard, which is the #1 correctness axis for this counter-apologetics use case
+ * (the operator's own commentary must never flag itself for quoting the thing
+ * it criticizes) — but scoped to ONE sentence with its neighbours as context,
+ * instead of a whole chapter's stance.
+ */
+export function buildFlagVerificationPrompt(
+  candidateText: string,
+  contextBefore: string[],
+  contextAfter: string[],
+  categoryName: string,
+  stanceProposition: string,
+): string {
+  const lines = [
+    ...contextBefore.map((t) => `    ${t}`),
+    `>>> ${candidateText}`,
+    ...contextAfter.map((t) => `    ${t}`),
+  ].join('\n');
+
+  return `Transcript excerpt. Judge ONLY the line marked >>>; the other lines are context.
+
+${lines}
+
+CLAIM (${categoryName}): ${stanceProposition}
+
+Question: in the line marked >>>, is the speaker asserting or promoting that claim as their own position?
+Answer "flag" if the speaker asserts it, endorses it, or repeats it approvingly as true.
+Answer "skip" if the speaker is reporting that other people make that claim, quoting it neutrally, asking about it, arguing against it, or if the line does not make that claim at all.
+
+Respond with JSON only: {"verdict":"flag"} or {"verdict":"skip"}`;
+}
+
 // -----------------------------------------------------------------------------
 // Metadata from Chapters Prompts
 // -----------------------------------------------------------------------------
 
-export const DESCRIPTION_FROM_CHAPTERS_PROMPT = `Write a 2-3 sentence description of this video from its chapters. Say specifically what it covers — the people, claims, and topics the chapters name, not generic filler. Output only the description, no preamble.
+/**
+ * PROMPT-HYGIENE RULING (docs/youtube-metadata-spec.md §6.1, operator,
+ * 2026-08-22) — binding on everything in this section:
+ *
+ *   Prompts carry CORRECT examples only. No incorrect examples, no ban lists,
+ *   ever. A model shown the bad form sometimes reproduces it, so the wrong forms
+ *   live exclusively in code (the narrated-actor detector in
+ *   description-composer.ts) and in the spec's own prose — never in anything a
+ *   model reads. Re-asks follow the same rule: restate the positive instruction,
+ *   never echo the rejected output or describe what was wrong with it.
+ *
+ * The register instruction below is therefore phrased as grammar to USE, not
+ * grammar to avoid.
+ */
+
+/**
+ * The hook line: the first ~150 characters of the description, which is the
+ * search-results snippet and everything a mobile viewer sees above the fold.
+ * Schema-constrained ({"hook": string}) on Ollama — see spec §5.
+ */
+export const HOOK_FROM_CHAPTERS_PROMPT = `Write the opening line of the YouTube description for this video. Output JSON only.
+
+One sentence, 150 characters maximum. Open with the exact phrase a viewer would type into search, at the very front of the line. Make it a precise promise of what the video actually shows. Include the specific people, places, claims and events when they are the draw.
+
+Write about the topics and the named people directly, in topic form — bare noun phrases or gerunds as sentence subjects.
+
+Lines in this style:
+- "Gene Bailey's chapter on Christian nationalist action and the David and Goliath framing"
+- "Debunking Gene Bailey's misreading of Luke 19:13 and his call to occupy territory"
+- "Kent Christmas's 2021 death-angel prophecy"
 
 Video: {videoTitle}
-Chapters:
-{chaptersList}
+Chapter titles:
+{chapterTitles}
+Topics: {topics}
 
-Description:`;
+Output exactly this shape and nothing else:
+{"hook": "your one sentence here"}`;
+
+/**
+ * The body paragraph: 150-300 words woven from ALL chapter summaries. The
+ * summaries narrate internally ("the speaker argues…") and that is correct for
+ * internal data — the register instruction here is what keeps that register from
+ * reaching the published field. Schema-constrained ({"body": string}) on Ollama.
+ */
+export const BODY_FROM_CHAPTERS_PROMPT = `Write the body paragraph of the YouTube description for this video. Output JSON only.
+
+One paragraph, between 150 and 300 words. Weave the chapters into a single continuous paragraph covering what happens and who says what. Name the real people, places, claims and events — every specific name is a search a viewer might run.
+
+Write in topic form throughout — bare noun phrases or gerunds as sentence subjects. Keep every real name, as possessives and objects: "Trump's refusal", "Paul Petit's report on the ceasefire", "Gene Bailey's misreading of Luke 19:13". The whole paragraph reads like the example lines below, only longer.
+
+Phrasing in this style:
+- "Debate about Trump's refusal to extend the Iran ceasefire MOU and rising tensions in the Strait of Hormuz"
+- "Gene Bailey's chapter on Christian nationalist action and the David and Goliath framing"
+- "Debunking Gene Bailey's misreading of Luke 19:13 and his call to occupy territory"
+- "Kent Christmas's 2021 death-angel prophecy and the fallout among charismatic prophets"
+
+Video: {videoTitle}
+People in this video: {people}
+Chapters:
+{chapterSummaries}
+
+Output exactly this shape and nothing else:
+{"body": "your paragraph here"}`;
+
+/**
+ * Appended verbatim for the ONE re-ask the narrated-actor detector is allowed to
+ * trigger. It restates the positive instruction and shows correct forms again;
+ * it does not quote, echo, paraphrase or characterise the rejected output, per
+ * the hygiene ruling above.
+ */
+export const REGISTER_RESTATEMENT = `
+Write in topic form throughout — bare noun phrases or gerunds as sentence subjects. Keep every real name, as possessives and objects.
+
+Phrasing in this style:
+- "Kent Christmas's 2021 death-angel prophecy"
+- "Debate about Trump's refusal to extend the Iran ceasefire MOU"
+- "Debunking Gene Bailey's misreading of Luke 19:13 and his call to occupy territory"`;
 
 export const TAGS_FROM_CHAPTERS_PROMPT = `List the people and topics in these video chapters. Output JSON only.
 - people: proper names of people mentioned in the chapters, Title Case.

@@ -65,7 +65,11 @@ export type AITaskKind = 'boundary' | 'chapter' | 'flags' | 'tags' | 'descriptio
 
 /**
  * Sampling temperature per task.
- *  - boundary / chapter / tags produce STRICT JSON — 0.15 keeps decoding
+ *  - boundary is GREEDY (0). It copies a sentence out of a window of transcript
+ *    verbatim, and any sampling at all is a chance to reword it — a reworded
+ *    quote fails to map back to a timestamp, which costs the boundary its
+ *    sentence-level precision.
+ *  - chapter / flags / tags produce STRICT JSON — 0.15 keeps decoding
  *    near-deterministic so the object parses cleanly (the old local path used
  *    0.7, which is far too hot for JSON extraction).
  *  - description / title are free text — 0.4 allows a little natural variation
@@ -74,6 +78,7 @@ export type AITaskKind = 'boundary' | 'chapter' | 'flags' | 'tags' | 'descriptio
 export function temperatureForTask(kind?: AITaskKind): number {
   switch (kind) {
     case 'boundary':
+      return 0;
     case 'chapter':
     case 'flags':
     case 'tags':
@@ -152,6 +157,20 @@ export type ThinkLevel = 'low' | 'medium' | 'high';
  * `think: true` (see ollama-capabilities).
  */
 export function thinkLevelForTask(_kind?: AITaskKind): ThinkLevel {
+  // EVERYTHING is 'low', boundary included.
+  //
+  // 'boundary' briefly ran at 'high'. That was correct for the prompt it had at
+  // the time — one call asking a model to find EVERY topic change in a 15-minute
+  // chunk, where thinking measurably changed the answer (3,053 output tokens and
+  // 3 boundaries at full effort, versus 1,132 tokens and 1 boundary at 'low',
+  // i.e. no real chapters at all).
+  //
+  // That prompt is gone. Boundaries are now SCORED from embedding cohesion in
+  // chapter-detection.service — pure code, no model — and the only remaining
+  // 'boundary' calls are the placement stage: read ~90 seconds of transcript and
+  // copy out the sentence the new subject starts on. That is mechanical quote
+  // copying with no global judgment in it, which is exactly the shape of task
+  // that pays the full thinking tax for nothing.
   return 'low';
 }
 

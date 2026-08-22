@@ -2,7 +2,8 @@
  * AI Analysis Service - Two-Pass Chapter-Centric Analysis
  *
  * This service implements a two-pass approach to video analysis:
- *   Pass 1: Detect chapter boundaries (chunked, lightweight)
+ *   Pass 1: Detect chapter boundaries (chapter-detection.service — embedding
+ *           cohesion scoring, then one small LLM call per selected boundary)
  *   Pass 2: Analyze each chapter with full context (title, summary)
  *   Pass 2b: Extract category flags per chapter, as a dedicated call
  *
@@ -11,21 +12,36 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { AIProviderService, AIProviderConfig } from './ai-provider.service';
 import { OllamaService } from './ollama.service';
-import { numCtxMaxForModel, stripThinkTags, parseProviderModel, AITaskKind } from './model-utils';
+import { estimateNumCtx, numCtxMaxForModel, parseProviderModel, AITaskKind } from './model-utils';
+import { ChapterDetectionService } from './chapter-detection.service';
+import { NliRankerService, assembleSentences, FlagCandidate } from './nli-ranker.service';
+import { findPhraseTimestamp } from './phrase-matcher';
+import { safeJsonParse } from './json-utils';
 import { ApiKeysService } from '../config/api-keys.service';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  buildBoundaryDetectionPrompt,
   buildChapterAnalysisPrompt,
   buildFlagExtractionPrompt,
+  buildFlagVerificationPrompt,
+  normalizeSensitivity,
   interpolatePrompt,
-  DESCRIPTION_FROM_CHAPTERS_PROMPT,
+  HOOK_FROM_CHAPTERS_PROMPT,
+  BODY_FROM_CHAPTERS_PROMPT,
+  REGISTER_RESTATEMENT,
   TAGS_FROM_CHAPTERS_PROMPT,
   TITLE_FROM_CHAPTERS_PROMPT,
   TITLE_FROM_WEBPAGE_PROMPT,
   AnalysisCategory,
 } from './prompts/analysis-prompts';
+import {
+  buildChapterLines,
+  buildHashtags,
+  composeDescription,
+  detectNarratedActor,
+  truncateAtWordBoundary,
+  HOOK_MAX_CHARS,
+} from './description-composer';
 
 // =============================================================================
 // INTERFACES
@@ -35,14 +51,6 @@ export interface Segment {
   start: number;
   end: number;
   text: string;
-}
-
-interface Chunk {
-  number: number;
-  startTime: number;
-  endTime: number;
-  text: string;
-  segments: Segment[];
 }
 
 export interface Quote {
@@ -80,12 +88,6 @@ export interface ChapterFlag {
   category: string;
   description: string;
   quote: string;
-}
-
-// Interface for boundary detection response
-interface BoundaryDetectionResult {
-  boundaries: string[];
-  end_topic: string;
 }
 
 // Interface for chapter analysis response
@@ -153,18 +155,35 @@ const JSON_PARSE_RETRIES = 2;
 /**
  * Tasks whose model may be overridden via `taskModels` in app-config.json.
  *
- * EVERY task is routable. The three that read raw transcript (boundary, chapter,
- * flags) are safe to route because the chunk/chapter caps are computed as the
- * MOST CONSERVATIVE limits across whichever models those tasks resolve to — see
- * `perTaskLimits` in analyzeTranscript. Sizing to one model while another does
- * the reading is what would silently truncate prompts, so the caps follow the
- * smallest context in play.
+ * EVERY task is routable. The two that read long spans of raw transcript
+ * (chapter, flags) are safe to route because the chapter caps are computed as
+ * the MOST CONSERVATIVE limits across whichever models those tasks resolve to —
+ * see `perTaskLimits` in analyzeTranscript. Sizing to one model while another
+ * does the reading is what would silently truncate prompts, so the caps follow
+ * the smallest context in play. 'boundary' now reads only a ~90-second window
+ * per call (see chapter-detection.service), so no cap constrains it at all.
  *
  * Tasks are executed grouped by model (chaptering, then Pass 2b, then metadata
  * ordered main-model-first), so each routed model loads once rather than being
  * swapped in and out per call.
  */
 const ROUTABLE_TASKS = ['boundary', 'chapter', 'flags', 'description', 'tags', 'title'] as const;
+
+/**
+ * Small local models that boundary PLACEMENT automatically prefers, best first.
+ *
+ * Placement is the one stage where a tiny model is not a compromise: it reads a
+ * ~90-second window and copies out one sentence. Measured on identical inputs
+ * (docs/chapter-pipeline-handoff.md §6), qwen3.5:4b placed 10/10 boundaries at
+ * ~1.2s/call against the 27B's ~5s/call, taking Pass 1 from ~60s to ~17s.
+ *
+ * The floor is REAL and measured — do not extend this list downward. qwen3.5:2b
+ * echoes the task back as JSON instead of answering (0/10) and qwen3.5:0.8b
+ * quotes text that maps to the wrong places. Below 4b the failure is instruction
+ * collapse, which no prompt fixes. Adding a NEW model here is fine once it has
+ * been scored against a reference run the same way.
+ */
+const PREFERRED_PLACEMENT_MODELS = ['qwen3.5:4b'] as const;
 
 /**
  * How many chapters have their flags extracted at once (Pass 2b).
@@ -190,9 +209,177 @@ const FLAG_EXTRACTION_CONCURRENCY = Math.max(
   Number(process.env.BRIEFCASE_FLAG_CONCURRENCY) || 1,
 );
 
+/**
+ * JSON Schema for the flag-extraction answer, handed to Ollama's `format`.
+ *
+ * WHY: a flag call on qwen3.8:27b measured ~3,400 output tokens for ~300 tokens
+ * of actual JSON — roughly 3,100 tokens (~185s of the ~200s call) spent
+ * reasoning. Placement showed the fix: constraining the grammar collapsed that
+ * stage to ~25 tokens and ~5s, because the schema admits nothing but the answer.
+ * Flags are the single most expensive stage in a run, so the same lever applies
+ * here. NOTE the structured-output trap this implies — the answer then arrives
+ * in Ollama's `thinking` field with `response` empty; ai-provider.service
+ * handles that.
+ *
+ * Shape matches parseFlagExtractionResponse EXACTLY: an object with a `flags`
+ * array, each item carrying category / description / quote.
+ *
+ * `category` is a plain string, NOT an enum of the enabled category names, on
+ * purpose: the prompt explicitly allows the model to coin a new lowercase-dashed
+ * category when nothing fits, and an enum would silently delete that affordance.
+ * The one thing this change is allowed to alter is the decoding grammar.
+ */
+const FLAG_EXTRACTION_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    flags: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          category: { type: 'string' },
+          description: { type: 'string' },
+          quote: { type: 'string' },
+        },
+        required: ['category', 'description', 'quote'],
+      },
+    },
+  },
+  required: ['flags'],
+};
+
+/**
+ * Opt-in for the schema above: BRIEFCASE_FLAGS_CONSTRAINED=1 sends it as
+ * Ollama's `format`, which suppresses the model's reasoning along with its
+ * prose. Measured A/B on qwen3.8:27b over the same chapter (3 paired runs,
+ * scored against a reference flag set): 5.5x faster (168s -> 30s/call) but
+ * recall dropped 7.3 -> 5.7 of 11 and false positives rose 0.7 -> 3.0 per run
+ * — the extras were reporting-not-asserting quotes, i.e. the assert-vs-debunk
+ * judgment the suppressed reasoning was paying for. Flags are the point of
+ * this product and a human reviews them, so quality is the default and speed
+ * is the explicit trade.
+ */
+const FLAGS_CONSTRAINED = process.env.BRIEFCASE_FLAGS_CONSTRAINED === '1';
+
+/**
+ * JSON Schema for ONE flag-verification verdict: `{"verdict": "flag" | "skip"}`.
+ *
+ * THE CONSTRAINT INVERSION — read this before "fixing" it to match
+ * FLAGS_CONSTRAINED above.
+ *
+ * FLAGS_CONSTRAINED documents that constraining the OLD flag call hurt: recall
+ * 7.3 -> 5.7 of 11 and false positives 0.7 -> 3.0 per run, because the
+ * suppressed reasoning was paying for the assert-vs-debunk judgment. That call
+ * is open-ended DISCOVERY: read a whole chapter, decide what is in it, produce
+ * a variable-length list of quotes and categories. Reasoning is the work there.
+ *
+ * This call is the opposite shape: the candidate is already chosen, the claim is
+ * already stated, and the answer is one of two tokens. It is
+ * mechanical-with-a-test, the same class as boundary placement — and the
+ * measurement inverts with the shape (final-score.txt, qwen3.8:27b, same 70
+ * candidates, same prompt):
+ *
+ *   constrained    9/10 recall vs the hand audit,  2.90s/call median, 204s total
+ *   UNCONSTRAINED  6/10 recall vs the hand audit, 20.30s/call median, 3,091s
+ *
+ * Unconstrained was WORSE on quality AND ~7x slower: given room to reason about
+ * one line, the model talks itself out of real flags and into "misinformation"
+ * mislabels. So this stage is constrained by DEFAULT and there is no opt-out —
+ * BRIEFCASE_FLAGS_DISCOVERY=1 switches to the whole other pipeline instead.
+ */
+const FLAG_VERIFICATION_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    verdict: { type: 'string', enum: ['flag', 'skip'] },
+  },
+  required: ['verdict'],
+  additionalProperties: false,
+};
+
+/**
+ * Force the OLD chapter-discovery flag pass instead of the ranker/verifier
+ * pipeline. This is the documented degradation path, kept for two real cases:
+ *
+ *  - a machine with no NLI worker environment (no venv, no model) — that case
+ *    selects itself automatically, this env var is not needed for it;
+ *  - `misinformation`, which entailment cannot rank at all (see
+ *    MISINFORMATION_EXCLUSION in nli-ranker.service.ts). A user whose flagging
+ *    is mostly about factual claims wants the LLM reading the transcript.
+ */
+const FLAGS_DISCOVERY = process.env.BRIEFCASE_FLAGS_DISCOVERY === '1';
+
+/**
+ * Output budget for one verification call, used only to SIZE num_ctx.
+ *
+ * A verdict is ~10 tokens of JSON and the constrained decode measured 27-30
+ * output tokens end to end; 2048 is headroom, not an expectation. It keeps the
+ * bucketed num_ctx at its floor so the stage pins one small context for every
+ * call instead of paying an Ollama model reload per call.
+ */
+const VERIFY_OUTPUT_BUDGET_TOKENS = 2048;
+
+/**
+ * How many sentences of context surround the candidate in the verification
+ * prompt. +/-2 is what the measured runs used: enough for the sentence before to
+ * establish who is speaking and whether the claim is being introduced or
+ * knocked down, small enough that the prompt stays ~1,500 characters.
+ */
+const VERIFY_CONTEXT_SENTENCES = 2;
+
+/**
+ * JSON Schema for tag extraction — the SAME `{people, topics}` shape the parser
+ * and every downstream consumer already expect. The schema pins the shape; the
+ * prompt and its intent are unchanged.
+ */
+const TAGS_EXTRACTION_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: {
+    people: { type: 'array', items: { type: 'string' } },
+    topics: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['people', 'topics'],
+};
+
+/**
+ * `{"hook": string}` — the ≤150-char search snippet (spec §5).
+ *
+ * Deliberately NO maxLength: measured on qwen3.5 4b/9b, Ollama enforces schema
+ * maxLength by TRUNCATING the decode mid-word — the server silently rewrites
+ * the search snippet. The 150-char cap is enforced in code (word-boundary
+ * truncation after the re-ask path), where the cut is at least controlled.
+ */
+const HOOK_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: { hook: { type: 'string' } },
+  required: ['hook'],
+};
+
+/** `{"body": string}` — the 150-300 word paragraph (spec §5). */
+const BODY_SCHEMA: Record<string, unknown> = {
+  type: 'object',
+  properties: { body: { type: 'string' } },
+  required: ['body'],
+};
+
+/**
+ * Kill switches for the metadata schemas — note the polarity is the OPPOSITE of
+ * FLAGS_CONSTRAINED, and deliberately so.
+ *
+ * Flags are a JUDGMENT task: the measured A/B showed structured output buys 5.5x
+ * speed at the cost of recall, so there quality is the default and speed is the
+ * explicit opt-in. Tags and description are MECHANICAL — extraction and format
+ * transforms over summaries that were already the product of judgment upstream —
+ * which is exactly the class where constraining is pure win (it collapses a
+ * thinking model's output from thousands of reasoning tokens to the answer; a
+ * prior run measured a 9b spending 7,369 tokens writing a filename). So they are
+ * constrained by DEFAULT, with an env escape hatch for A/B-ing the trade back.
+ */
+const TAGS_UNCONSTRAINED = process.env.BRIEFCASE_TAGS_UNCONSTRAINED === '1';
+const DESCRIPTION_UNCONSTRAINED = process.env.BRIEFCASE_DESCRIPTION_UNCONSTRAINED === '1';
+
 // Job-level failure accounting. Any analysis step that cannot produce a real
-// result — a boundary chunk that won't parse after a retry, a chapter that
-// exhausts its retries, a description/tags generation that fails — is recorded
+// result — a chapter that exhausts its retries, a description/tags generation
+// that fails — is recorded
 // as an explicit failure instead of being papered over with fabricated data.
 // Once this many steps have failed, the whole job aborts with TOO_MANY_FAILURES
 // rather than shipping a mostly-empty analysis that looks successful.
@@ -201,167 +388,6 @@ const MAX_FAILURES = 10;
 // =============================================================================
 // JSON EXTRACTION AND VALIDATION HELPERS
 // =============================================================================
-
-/**
- * Extract JSON from AI response text, handling various formats
- * Tries multiple strategies to find valid JSON in the response
- */
-function extractJsonFromResponse(response: string): string | null {
-  if (!response || typeof response !== 'string') {
-    return null;
-  }
-
-  let text = response.trim();
-
-  // Strategy 1: Remove markdown code blocks
-  if (text.includes('```')) {
-    // Try to extract content between ```json and ``` or just ``` and ```
-    const jsonBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (jsonBlockMatch) {
-      text = jsonBlockMatch[1].trim();
-    } else {
-      // Fallback: remove all ``` lines
-      text = text.split('\n').filter(l => !l.trim().startsWith('```')).join('\n').trim();
-    }
-  }
-
-  // Strategy 2: Find JSON object with balanced braces
-  const firstBrace = text.indexOf('{');
-  const lastBrace = text.lastIndexOf('}');
-
-  if (firstBrace !== -1 && lastBrace > firstBrace) {
-    // Extract the portion that looks like JSON
-    let jsonCandidate = text.substring(firstBrace, lastBrace + 1);
-
-    // Try to balance braces if needed — ignore braces that appear inside quoted
-    // string values (tracking string/escape state) so a `{`/`}` in the text
-    // can't truncate otherwise-valid JSON.
-    let braceCount = 0;
-    let endIndex = -1;
-    let inString = false;
-    let escaped = false;
-    for (let i = 0; i < jsonCandidate.length; i++) {
-      const ch = jsonCandidate[i];
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (ch === '\\') {
-        escaped = true;
-        continue;
-      }
-      if (ch === '"') {
-        inString = !inString;
-        continue;
-      }
-      if (inString) continue;
-      if (ch === '{') braceCount++;
-      if (ch === '}') braceCount--;
-      if (braceCount === 0) {
-        endIndex = i;
-        break;
-      }
-    }
-
-    if (endIndex !== -1) {
-      jsonCandidate = jsonCandidate.substring(0, endIndex + 1);
-    }
-
-    return jsonCandidate;
-  }
-
-  return null;
-}
-
-/**
- * Attempt to fix common JSON issues from AI responses
- */
-function attemptJsonRepair(jsonStr: string): string {
-  let fixed = jsonStr;
-
-  // Fix trailing commas before closing braces/brackets
-  fixed = fixed.replace(/,\s*([\]}])/g, '$1');
-
-  // NO unquoted-key quoting: the naive /([{,]\s*)(\w+)(\s*:)/ regex also matches
-  // `word:` sequences INSIDE string values (e.g. a summary containing
-  // ", note: see above"), rewriting them and producing JSON that parses into
-  // semantically WRONG data — fabricated-but-passable content, which violates
-  // this file's "fail, don't fabricate" policy. A genuinely unquoted key is rare
-  // from cloud models; let such a response fall through to retry / recordFailure.
-
-  // Fix single quotes to double quotes (careful with apostrophes in text)
-  // Only do this for key-value patterns
-  fixed = fixed.replace(/'(\w+)'(\s*:)/g, '"$1"$2');
-
-  // Remove control characters that break JSON
-  fixed = fixed.replace(/[\x00-\x1F\x7F]/g, (match) => {
-    if (match === '\n' || match === '\r' || match === '\t') {
-      return match; // Keep these
-    }
-    return ''; // Remove others
-  });
-
-  // Fix truncated strings - if we have an unclosed quote, try to close it
-  const quoteCount = (fixed.match(/(?<!\\)"/g) || []).length;
-  if (quoteCount % 2 !== 0) {
-    // Odd number of quotes - likely truncated
-    // Try to close the last open string and the object
-    if (!fixed.endsWith('"')) {
-      fixed = fixed + '"';
-    }
-    // Count braces
-    const openBraces = (fixed.match(/{/g) || []).length;
-    const closeBraces = (fixed.match(/}/g) || []).length;
-    for (let i = 0; i < openBraces - closeBraces; i++) {
-      fixed = fixed + '}';
-    }
-  }
-
-  return fixed;
-}
-
-/**
- * Safely parse JSON with multiple fallback strategies
- * Returns parsed object or null if all strategies fail
- */
-function safeJsonParse<T>(response: string, logger?: Logger): T | null {
-  if (!response) {
-    return null;
-  }
-
-  // Belt-and-braces: drop any inline <think>…</think> before extraction, in case
-  // a thinking model's template inlined its reasoning into the response text.
-  const cleaned = stripThinkTags(response);
-
-  // Step 1: Extract JSON from response
-  const jsonStr = extractJsonFromResponse(cleaned);
-  if (!jsonStr) {
-    logger?.warn('[JSON Parse] No JSON object found in response');
-    return null;
-  }
-
-  // Step 2: Try direct parse
-  try {
-    return JSON.parse(jsonStr) as T;
-  } catch (e) {
-    logger?.debug(`[JSON Parse] Direct parse failed: ${(e as Error).message}`);
-  }
-
-  // Step 3: Try with repairs (markdown already stripped, braces balanced above).
-  try {
-    const repaired = attemptJsonRepair(jsonStr);
-    return JSON.parse(repaired) as T;
-  } catch (e) {
-    logger?.debug(`[JSON Parse] Repaired parse failed: ${(e as Error).message}`);
-  }
-
-  // NO regex field-scrape last resort: it could fabricate a passable object
-  // (e.g. title:"Unknown") that masks a real parse failure. If markdown-strip +
-  // brace-balance + repair all fail, this IS a failure — return null so the
-  // caller retries or records it explicitly.
-  logger?.warn(`[JSON Parse] All parse strategies failed for: ${jsonStr.substring(0, 200)}...`);
-  return null;
-}
 
 /**
  * Validate chapter analysis result has required fields
@@ -402,113 +428,19 @@ function validateChapterAnalysisResult(data: unknown): ChapterAnalysisResult | n
   };
 }
 
-/**
- * Validate boundary detection result has required fields
- */
-function validateBoundaryResult(data: unknown): BoundaryDetectionResult | null {
-  if (!data || typeof data !== 'object') {
-    return null;
-  }
-
-  const obj = data as Record<string, unknown>;
-
-  // Boundaries should be array of strings
-  let boundaries: string[] = [];
-  if (Array.isArray(obj.boundaries)) {
-    boundaries = obj.boundaries.filter(
-      (b): b is string => typeof b === 'string' && b.trim().length > 0,
-    );
-  }
-
-  // end_topic should be string
-  const endTopic = typeof obj.end_topic === 'string' ? obj.end_topic : '';
-
-  return {
-    boundaries,
-    end_topic: endTopic,
-  };
-}
-
-// =============================================================================
-// FUZZY STRING MATCHING
-// =============================================================================
-
-/**
- * Calculate Levenshtein distance between two strings
- * Returns the minimum number of single-character edits needed
- */
-function levenshteinDistance(str1: string, str2: string): number {
-  const m = str1.length;
-  const n = str2.length;
-
-  // Create a matrix of distances
-  const dp: number[][] = Array(m + 1)
-    .fill(null)
-    .map(() => Array(n + 1).fill(0));
-
-  // Initialize first column and row
-  for (let i = 0; i <= m; i++) dp[i][0] = i;
-  for (let j = 0; j <= n; j++) dp[0][j] = j;
-
-  // Fill in the rest of the matrix
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      if (str1[i - 1] === str2[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1];
-      } else {
-        dp[i][j] = 1 + Math.min(
-          dp[i - 1][j],     // deletion
-          dp[i][j - 1],     // insertion
-          dp[i - 1][j - 1], // substitution
-        );
-      }
-    }
-  }
-
-  return dp[m][n];
-}
-
-/**
- * Calculate similarity ratio between two strings (0 to 1)
- * Uses Levenshtein distance normalized by the longer string length
- */
-function stringSimilarity(str1: string, str2: string): number {
-  if (str1 === str2) return 1;
-  if (str1.length === 0 || str2.length === 0) return 0;
-
-  const distance = levenshteinDistance(str1, str2);
-  const maxLength = Math.max(str1.length, str2.length);
-
-  return 1 - distance / maxLength;
-}
-
-/**
- * Normalize text for fuzzy comparison
- * Removes punctuation, extra spaces, and lowercases
- */
-function normalizeForComparison(text: string): string {
-  return text
-    .toLowerCase()
-    .replace(/[^\w\s]/g, '') // Remove punctuation
-    .replace(/\s+/g, ' ')    // Normalize whitespace
-    .trim();
-}
-
 // Model size limits - conservative estimates based on typical context windows
-// These ensure chunks fit comfortably with room for prompts and output
+// These ensure a chapter fits comfortably with room for prompts and output
 interface ModelLimits {
-  maxChunkChars: number;       // Max chars per chunk for boundary detection
   maxChapterChars: number;     // Max chars per chapter for analysis
-  chunkMinutes: number;        // Target chunk duration for boundary detection
   maxChapterSeconds: number;   // Max chapter duration before splitting
 }
 
 /**
- * Compute per-chunk/per-chapter size limits that are guaranteed to FIT the
- * context window the model will actually run with, so the transcript is never
- * silently truncated:
- *  - time granularity (chunkMinutes / maxChapterSeconds) is tiered by model size
- *    (bigger models reason over longer spans well),
+ * Compute per-chapter size limits that are guaranteed to FIT the context window
+ * the model will actually run with, so the transcript is never silently
+ * truncated:
+ *  - time granularity (maxChapterSeconds) is tiered by model size (bigger models
+ *    reason over longer spans well),
  *  - but the CHARACTER caps are derived from `contextTokens` — the real ceiling.
  *
  * `contextTokens` is the effective context window:
@@ -538,30 +470,26 @@ function getModelLimits(modelName: string, contextTokens: number): ModelLimits {
   const CHARS_PER_TOKEN = 3;
   const usableInputTokens = Math.max(1024, contextTokens - OUTPUT_RESERVE_TOKENS - SCAFFOLD_TOKENS);
   const maxChapterChars = usableInputTokens * CHARS_PER_TOKEN;
-  // Boundary chunks carry a lighter prompt; the same input budget is safe.
-  const maxChunkChars = maxChapterChars;
 
   // Time granularity tiers (independent of the char caps above).
-  let chunkMinutes: number;
   let maxChapterSeconds: number;
   if (paramBillions <= 3) {
-    chunkMinutes = 3;
     maxChapterSeconds = 180;
   } else if (paramBillions <= 7) {
-    chunkMinutes = 7;
     maxChapterSeconds = 360;
   } else if (paramBillions <= 14) {
-    chunkMinutes = 12;
     maxChapterSeconds = 540;
   } else if (paramBillions <= 32) {
-    chunkMinutes = 15;
-    maxChapterSeconds = 600;
+    // 900s (15 min), raised from 600. Flag extraction is ~72% of a run and costs
+    // a large FIXED thinking overhead per call, so fewer/longer chapters beat
+    // more/shorter ones: a 40-min video goes from ~7 flag calls to ~4. Safe
+    // against truncation — 900s of speech is ~13.5k chars against a 21.5k cap.
+    maxChapterSeconds = 900;
   } else {
-    chunkMinutes = 20;
     maxChapterSeconds = 720;
   }
 
-  return { maxChunkChars, maxChapterChars, chunkMinutes, maxChapterSeconds };
+  return { maxChapterChars, maxChapterSeconds };
 }
 
 // =============================================================================
@@ -576,6 +504,8 @@ export class AIAnalysisService {
     private readonly aiProviderService: AIProviderService,
     private readonly ollamaService: OllamaService,
     private readonly apiKeysService: ApiKeysService,
+    private readonly chapterDetectionService: ChapterDetectionService,
+    private readonly nliRanker: NliRankerService,
   ) {}
 
   /**
@@ -608,10 +538,8 @@ export class AIAnalysisService {
         if (typeof raw[task] === 'string' && raw[task].trim()) out[task] = raw[task].trim();
       }
 
-      // The transcript-facing tasks are deliberately NOT routable: chunk and
-      // chapter character caps are derived from the main model's context window
-      // (see getModelLimits), so pointing them at a differently-sized model would
-      // silently mis-size every prompt. Warn loudly instead of ignoring quietly.
+      // Anything outside ROUTABLE_TASKS is not a task this pipeline runs, so an
+      // entry for it silently does nothing. Warn loudly instead of ignoring it.
       const rejected = Object.keys(raw).filter(
         (k) => !ROUTABLE_TASKS.includes(k as (typeof ROUTABLE_TASKS)[number]),
       );
@@ -668,9 +596,107 @@ export class AIAnalysisService {
   }
 
   /**
+   * List the model tags installed on an Ollama endpoint, or null if the endpoint
+   * is not reachable. 2-second budget: this runs on the analysis hot path purely
+   * to take an optimization, so an unreachable or wedged daemon must cost
+   * ~nothing and simply mean "no small model available".
+   */
+  private async listOllamaTags(endpoint: string): Promise<string[] | null> {
+    try {
+      const response = await fetch(`${endpoint}/api/tags`, {
+        signal: AbortSignal.timeout(2000),
+      });
+      if (!response.ok) return null;
+      const data = await response.json();
+      const models = Array.isArray(data?.models) ? data.models : [];
+      return models
+        .map((m: { name?: unknown }) => (typeof m?.name === 'string' ? m.name : ''))
+        .filter((name: string) => !!name);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Automatically route boundary PLACEMENT to a small local model when one is
+   * installed — no configuration required.
+   *
+   * Placement is per-boundary quote copying (~10 calls per hour of video) and a
+   * 4B does it as accurately as a 27B at a quarter of the time, so the win is
+   * free and worth taking by default rather than only for users who happen to
+   * have written a `taskModels.boundary` line. Deliberately applies even when
+   * the MAIN provider is claude/openai: a cloud user with Ollama installed still
+   * gets fast local placement, and placement is the one task where nothing is
+   * lost by it (a failed placement degrades to the junction time).
+   *
+   * Precedence: explicit `taskModels.boundary` > BRIEFCASE_PLACE_MODEL >
+   * auto-detection > the job's main model.
+   *
+   * MUTATES `overrides` so every downstream `resolveTaskConfig(_, 'boundary')`
+   * — including the context-limit survey — sees the same answer, and so the
+   * /api/tags probe happens exactly ONCE per analysis run. It is deliberately
+   * not cached process-wide: models get pulled and removed between runs.
+   */
+  private async applyAutoPlacementModel(
+    overrides: Partial<Record<AITaskKind, string>>,
+    ollamaEndpoint?: string,
+  ): Promise<void> {
+    if (overrides.boundary) {
+      this.logger.log(
+        `[Placement] boundary -> ${overrides.boundary} (explicit taskModels.boundary override)`,
+      );
+      return;
+    }
+
+    // Env override names a bare Ollama tag and is taken on faith — it exists to
+    // test a model that may not be installed yet, so it skips the probe.
+    const forced = (process.env.BRIEFCASE_PLACE_MODEL || '').trim();
+    if (forced) {
+      overrides.boundary = `ollama:${forced}`;
+      this.logger.log(
+        `[Placement] boundary -> ollama:${forced} (BRIEFCASE_PLACE_MODEL; availability not checked)`,
+      );
+      return;
+    }
+
+    const endpoint = ollamaEndpoint || 'http://localhost:11434';
+    const installed = await this.listOllamaTags(endpoint);
+    if (!installed) {
+      this.logger.log(
+        `[Placement] boundary -> main model (Ollama not reachable at ${endpoint}; ` +
+        `placement stays on the job's model)`,
+      );
+      return;
+    }
+
+    const match = PREFERRED_PLACEMENT_MODELS.find((preferred) =>
+      installed.some(
+        (name) =>
+          name === preferred ||
+          name === `${preferred}:latest` ||
+          name.startsWith(`${preferred}-`),
+      ),
+    );
+
+    if (!match) {
+      this.logger.log(
+        `[Placement] boundary -> main model (none of ${PREFERRED_PLACEMENT_MODELS.join(', ')} ` +
+        `installed on ${endpoint})`,
+      );
+      return;
+    }
+
+    overrides.boundary = `ollama:${match}`;
+    this.logger.log(
+      `[Placement] boundary -> ollama:${match} (auto-detected on ${endpoint}; ` +
+      `small models place boundaries as accurately as large ones, ~4x faster)`,
+    );
+  }
+
+  /**
    * Main entry point: Analyze transcript using AI
    * Uses two-pass chapter-centric analysis:
-   *   Pass 1: Detect chapter boundaries (chunked, lightweight)
+   *   Pass 1: Detect chapter boundaries (embedding-scored, then placed)
    *   Pass 2: Analyze each chapter with full context (title, summary)
    *   Pass 2b: Extract category flags per chapter, as a dedicated call
    */
@@ -817,6 +843,11 @@ export class AIAnalysisService {
       // them to the same model costs exactly ONE model swap, not three.
       const taskModels = this.loadTaskModelOverrides();
 
+      // Boundary placement takes a small local model automatically when one is
+      // installed (one /api/tags probe for the whole run). No-op when the user
+      // configured 'boundary' explicitly, or when Ollama is not reachable.
+      await this.applyAutoPlacementModel(taskModels, ollamaEndpoint);
+
       // Effective context window each raw-transcript task will actually use.
       //
       // boundary / chapter / flags all read raw transcript, and each may now be
@@ -831,7 +862,13 @@ export class AIAnalysisService {
             ? numCtxMaxForModel(cfg.model) // what we request as num_ctx
             : 128000; // claude/openai have large windows
 
-      const rawTranscriptTasks: AITaskKind[] = ['boundary', 'chapter', 'flags'];
+      // 'boundary' is NOT in this list. Placement reads a fixed ~90-second
+      // window it sizes itself (chapter-detection.service pins one num_ctx from
+      // its own largest prompt), so no chapter cap constrains it — and now that
+      // placement auto-routes to a small local model, including it here would
+      // drag the shared char cap down to that model's context for a cloud job
+      // whose chapter/flags tasks have a 128K window.
+      const rawTranscriptTasks: AITaskKind[] = ['chapter', 'flags'];
       const perTaskLimits = rawTranscriptTasks.map((t) => {
         const cfg = this.resolveTaskConfig(aiConfig, t, taskModels);
         const ctx = contextFor(cfg);
@@ -852,9 +889,7 @@ export class AIAnalysisService {
       const mainLimits = getModelLimits(model, contextFor(aiConfig));
       const contextTokens = Math.min(...perTaskLimits.map((x) => x.ctx));
       const modelLimits: ModelLimits = {
-        maxChunkChars: Math.min(...perTaskLimits.map((x) => x.limits.maxChunkChars)),
         maxChapterChars: Math.min(...perTaskLimits.map((x) => x.limits.maxChapterChars)),
-        chunkMinutes: mainLimits.chunkMinutes,
         maxChapterSeconds: mainLimits.maxChapterSeconds,
       };
 
@@ -867,8 +902,8 @@ export class AIAnalysisService {
         );
       }
       this.logger.log(
-        `[Model Limits] effective ctx=${contextTokens}: chunkMinutes=${modelLimits.chunkMinutes}, ` +
-        `maxChunkChars=${modelLimits.maxChunkChars}, maxChapterChars=${modelLimits.maxChapterChars}, ` +
+        `[Model Limits] effective ctx=${contextTokens}: ` +
+        `maxChapterChars=${modelLimits.maxChapterChars}, ` +
         `maxChapterSeconds=${modelLimits.maxChapterSeconds}`,
       );
 
@@ -876,31 +911,63 @@ export class AIAnalysisService {
       // PASS 1: Detect chapter boundaries
       // =========================================================================
       sendProgress('analysis', 5, 'Detecting chapter boundaries...');
-      const boundaries = await this.detectChapterBoundaries(
-        this.resolveTaskConfig(aiConfig, 'boundary', taskModels),
+      // Pass 1 is no longer an LLM reading the transcript for boundaries — that
+      // prompt returned a PREFIX of the boundaries (1-3) and stopped, missing
+      // e.g. a mid-video ad break entirely. Boundaries are now SCORED from
+      // embeddings and only PLACED by the model (see chapter-detection.service).
+      const pass1StartTime = Date.now();
+      const detection = await this.chapterDetectionService.detectBoundaries({
         segments,
+        boundaryConfig: this.resolveTaskConfig(aiConfig, 'boundary', taskModels),
+        maxChapterSeconds: modelLimits.maxChapterSeconds,
         videoTitle,
-        modelLimits,
-        recordFailure,
-        trackTokens,
-        // Pass 1 owns the 5%-25% band; walk it as chunks complete so the queue
-        // sees steady progress instead of a frozen 5% for the whole pass.
-        (current, total) => {
+        ollamaEndpoint,
+        onTokens: trackTokens,
+        // Pass 1 owns the 5%-25% band. Scoring is one early tick (it is seconds
+        // of embedding, not minutes of generation); the rest of the band walks
+        // with the per-boundary placement calls, so the queue sees steady
+        // progress instead of a frozen 5% for the whole pass.
+        onProgress: (current, total, label) => {
           const pct = 5 + Math.round((current / Math.max(1, total)) * 20);
-          sendProgress('analysis', pct, `Detecting chapter boundaries (${current}/${total} chunks)...`);
+          sendProgress('analysis', pct, label);
         },
-      );
-      sendProgress('analysis', 25, `Found ${boundaries.length} chapters`);
+      });
+      const boundaries = detection.boundaries;
+      sendProgress('analysis', 25, `Found ${boundaries.length} chapters (${detection.scorer} scoring)`);
 
-      // Calculate total API calls for accurate progress reporting
-      // Pass 2 = 1 call per chapter, plus 3 more for description, tags, title
-      // chapters + one flag-extraction call each + description/tags/title.
-      // Omitting the flag pass here is what produced negative ETAs and a
-      // "4/4 API calls" counter on a run that actually made seven.
+      // Calculate total API calls for accurate progress reporting:
+      // chapters + one flag-extraction call each + the FOUR metadata calls
+      // (tags, description hook, description body, title), plus the
+      // boundary-placement calls Pass 1 already made.
+      //
+      // The narrated-actor re-ask (at most one per viewer-facing field) is NOT
+      // counted here, exactly as chapter and flag PARSE retries are not: this
+      // number is the expected-work estimate the ETA divides by, and retries are
+      // exceptions. Their real cost is still recorded — every attempt, retry
+      // included, goes through trackTokens and lands in tokenStats.apiCalls.
+      // Omitting the flag pass
+      // here is what produced negative ETAs and a "4/4 API calls" counter on a
+      // run that actually made seven; omitting Pass 1's calls would understate
+      // the same way. The embedding call is NOT counted — it is one batch
+      // request measured in seconds, not a generation call, and counting it
+      // would poison the ETA's average-call-time.
+      const pass1Calls = detection.placeCalls;
       let chapterCallCount = boundaries.length;
-      totalApiCalls = chapterCallCount * 2 + 3;
-      completedApiCalls = 0;
-      pass2StartTime = Date.now();  // Start timing from Pass 2 for accurate ETA
+      // Flag calls are NO LONGER one per chapter. On the default ranked path
+      // there is one call per (sentence, category) candidate, a number nothing
+      // knows until the ranker has run — so this starts at the old
+      // one-per-chapter estimate and the flag stage corrects it the moment it
+      // knows, exactly as the chapter loop corrects chapterCallCount after long
+      // chapters are split.
+      let flagCallCount = chapterCallCount;
+      const recomputeTotalApiCalls = () => {
+        totalApiCalls = chapterCallCount + flagCallCount + 4 + pass1Calls;
+      };
+      recomputeTotalApiCalls();
+      completedApiCalls = pass1Calls;
+      // ETA averages over every counted call, so the clock starts where the
+      // first counted call did — the placement stage, not Pass 2.
+      pass2StartTime = pass1Calls > 0 ? pass1StartTime : Date.now();
 
       // Progress callback that calculates percentage based on API calls
       // Range: 25% to 95% (70% total for all API calls)
@@ -927,19 +994,31 @@ export class AIAnalysisService {
           // Post-split chapter count is only known here; correct the estimate so
           // the ETA stops drifting when Pass 2 splits long chapters.
           if (total !== chapterCallCount) {
+            // Until the flag stage reports its own count, one-per-chapter stays
+            // the best available estimate for it.
+            if (flagCallCount === chapterCallCount) flagCallCount = total;
             chapterCallCount = total;
-            totalApiCalls = chapterCallCount * 2 + 3;
+            recomputeTotalApiCalls();
           }
-          completedApiCalls = current;
+          completedApiCalls = pass1Calls + current;
           const progress = calculateProgress();
           sendProgress('analysis', progress, `Analyzing chapter ${current}/${total} (${completedApiCalls}/${totalApiCalls} API calls)...`);
         },
         taskModels,
         (current, total) => {
-          completedApiCalls = chapterCallCount + current;
+          if (total !== flagCallCount) {
+            flagCallCount = total;
+            recomputeTotalApiCalls();
+          }
+          completedApiCalls = pass1Calls + chapterCallCount + current;
           const progress = calculateProgress();
           sendProgress('analysis', progress, `Finding flagged quotes ${current}/${total} (${completedApiCalls}/${totalApiCalls} API calls)...`);
         },
+        // Ranking is one quick tick — seconds of local scoring, not a
+        // generation call — so it reports a message at the CURRENT percentage
+        // and is deliberately not counted in totalApiCalls (counting it would
+        // poison the ETA's average-call-time, same as the embedding call).
+        (message) => sendProgress('analysis', calculateProgress(), message),
       );
       sendProgress('analysis', calculateProgress(), `Analyzed ${chapters.length} chapters, found ${flags.length} flags`);
 
@@ -980,11 +1059,23 @@ export class AIAnalysisService {
       let tags: Tags | null = null;
       let suggestedTitle: string | null = null;
 
+      // TAGS RUNS FIRST, and the order in this array is load-bearing: grouping is
+      // stable within a model group, and the description step CONSUMES the tags
+      // result (people ground the body, topics feed the hook and the code-built
+      // hashtag line). With every task on one model — the default — this array
+      // order is the execution order, so tags always lands first. When tags is
+      // routed to a different model, grouping may still run description first;
+      // that degrades cleanly (the chapter summaries carry the same names) rather
+      // than failing, which is why this is an ordering preference and not a
+      // dependency the loop enforces.
+      //
+      // `calls` is what the ETA counter advances by: description is TWO calls
+      // now (hook, then body), not one.
       const metadataSteps = (
         [
-          { task: 'description', label: 'Generating description' },
-          { task: 'tags', label: 'Extracting tags' },
-          { task: 'title', label: 'Generating title' },
+          { task: 'tags', label: 'Extracting tags', calls: 1 },
+          { task: 'description', label: 'Generating description', calls: 2 },
+          { task: 'title', label: 'Generating title', calls: 1 },
         ] as const
       ).map((step) => {
         const cfg = this.resolveTaskConfig(aiConfig, step.task, taskModels);
@@ -1008,7 +1099,7 @@ export class AIAnalysisService {
 
       for (const key of orderedKeys) {
         for (const step of metadataSteps.filter((s) => s.key === key)) {
-          completedApiCalls++;
+          completedApiCalls += step.calls;
           sendProgress(
             'analysis',
             calculateProgress(),
@@ -1017,7 +1108,7 @@ export class AIAnalysisService {
           switch (step.task) {
             case 'description':
               description = await this.generateDescriptionFromChapters(
-                step.cfg, chapters, videoTitle, recordFailure, trackTokens,
+                step.cfg, chapters, videoTitle, tags, recordFailure, trackTokens,
               );
               break;
             case 'tags':
@@ -1082,399 +1173,18 @@ export class AIAnalysisService {
       const message = `AI analysis failed: ${(error as Error).message}`;
       this.logger.error(message);
       throw new Error(message);
+    } finally {
+      // The ranker worker is per-analysis: it holds a loaded model and ~1GB of
+      // Python, and there is no reason to keep that resident between runs. It
+      // also joins the app's graceful-shutdown path (OnApplicationShutdown), so
+      // a crash mid-run cannot leave an orphan python behind either.
+      this.nliRanker.stop();
     }
-  }
-
-  /**
-   * Split transcript into time-based chunks
-   */
-  private chunkTranscript(
-    segments: Segment[],
-    chunkMinutes: number = 15,
-  ): Chunk[] {
-    console.log(`[chunkTranscript] Input segments: ${segments?.length || 0}, chunkMinutes: ${chunkMinutes}`);
-    const chunks: Chunk[] = [];
-
-    if (!segments || segments.length === 0) {
-      console.log(`[chunkTranscript] WARNING: No segments to chunk!`);
-      return [];
-    }
-
-    const chunkDuration = chunkMinutes * 60;
-    const totalDuration = segments[segments.length - 1].end;
-    console.log(`[chunkTranscript] Total duration: ${totalDuration}s, chunk duration: ${chunkDuration}s`);
-
-    let currentStart = 0;
-    let chunkNum = 1;
-
-    while (currentStart < totalDuration) {
-      const chunkEnd = currentStart + chunkDuration;
-
-      const chunkSegments = segments.filter(
-        (seg) => seg.start >= currentStart && seg.start < chunkEnd,
-      );
-
-      if (chunkSegments.length > 0) {
-        const chunkText = chunkSegments.map((seg) => seg.text.trim()).join(' ');
-        chunks.push({
-          number: chunkNum,
-          startTime: currentStart,
-          endTime: Math.min(chunkEnd, totalDuration),
-          text: chunkText,
-          segments: chunkSegments,
-        });
-        console.log(`[chunkTranscript] Chunk ${chunkNum}: ${chunkSegments.length} segments, time ${currentStart}-${Math.min(chunkEnd, totalDuration)}`);
-        chunkNum++;
-      }
-
-      currentStart = chunkEnd;
-    }
-
-    console.log(`[chunkTranscript] Created ${chunks.length} chunks total`);
-    return chunks;
-  }
-
-  /**
-   * Find the timestamp for a specific phrase in the transcript segments
-   * Uses multiple strategies including fuzzy matching to handle:
-   * - Whisper transcription errors
-   * - AI quote corrections/paraphrasing
-   * - Cross-segment quotes
-   */
-  private findPhraseTimestamp(
-    phrase: string,
-    segments: Segment[],
-  ): number | null {
-    if (!phrase || !segments || segments.length === 0) {
-      return null;
-    }
-
-    const normalizedPhrase = normalizeForComparison(phrase);
-    if (normalizedPhrase.length < 3) {
-      return null;
-    }
-
-    // Use first ~50 chars for matching (long quotes may span multiple segments)
-    const searchPhrase = normalizedPhrase.substring(0, 50);
-
-    // MATCHING STRATEGY (correctness-preserving performance rework):
-    //   Segment text is normalized exactly ONCE here, up front, instead of being
-    //   re-normalized inside every strategy below (previously ~5x per segment).
-    //   The cheap exact/substring passes (Strategies 1 & 2) run first and
-    //   early-return, so most calls never reach the fuzzy work at all. The
-    //   expensive per-segment Levenshtein (Strategy 3) previously ran against
-    //   EVERY segment (O(segments x quote), quadratic-ish, blocking the event
-    //   loop). It now runs only over a SHORTLIST of segments that share at least
-    //   one distinctive (uncommon, >3 char) word with the phrase. This does not
-    //   change which segment is selected: for a segment's normalized text to be
-    //   >=65% character-similar to the phrase it must share the phrase's
-    //   distinctive words, so the true best fuzzy match is always in the
-    //   shortlist. If the phrase has NO distinctive words (all common/short) we
-    //   cannot prefilter and fall back to scanning every segment (exactly the
-    //   old behavior), so accuracy is never weaker than before.
-    const normSegs = segments.map((s) => normalizeForComparison(s.text));
-
-    // Strategy 1: Direct substring match using first part of phrase
-    for (let i = 0; i < segments.length; i++) {
-      if (normSegs[i].includes(searchPhrase)) {
-        return segments[i].start;
-      }
-    }
-
-    // Strategy 2: Shorter prefix match (first 25 chars)
-    if (searchPhrase.length > 25) {
-      const shortSearchPhrase = normalizedPhrase.substring(0, 25);
-      for (let i = 0; i < segments.length; i++) {
-        if (normSegs[i].includes(shortSearchPhrase)) {
-          return segments[i].start;
-        }
-      }
-    }
-
-    const FUZZY_THRESHOLD = 0.65; // 65% similarity required
-
-    // Uncommon words drive both the Strategy-3 shortlist and Strategy 4.
-    const commonWords = new Set([
-      'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
-      'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
-      'should', 'may', 'might', 'must', 'shall', 'can', 'need', 'dare',
-      'to', 'of', 'in', 'for', 'on', 'with', 'at', 'by', 'from', 'as',
-      'into', 'through', 'during', 'before', 'after', 'above', 'below',
-      'and', 'but', 'or', 'nor', 'so', 'yet', 'both', 'either', 'neither',
-      'not', 'only', 'own', 'same', 'than', 'too', 'very', 'just',
-      'that', 'this', 'these', 'those', 'what', 'which', 'who', 'whom',
-      'i', 'you', 'he', 'she', 'it', 'we', 'they', 'me', 'him', 'her', 'us', 'them',
-      'my', 'your', 'his', 'its', 'our', 'their', 'mine', 'yours', 'hers', 'ours', 'theirs',
-      'about', 'also', 'back', 'because', 'come', 'could', 'day', 'even',
-      'first', 'get', 'give', 'go', 'good', 'know', 'like', 'look', 'make',
-      'new', 'now', 'one', 'people', 'say', 'see', 'some', 'take', 'think',
-      'time', 'two', 'use', 'want', 'way', 'well', 'work', 'year',
-    ]);
-
-    const phraseWords = normalizedPhrase.split(/\s+/).filter((w) => w.length > 3 && !commonWords.has(w));
-
-    // Build the Strategy-3 candidate shortlist: segment indices that share at
-    // least one distinctive word with the phrase. Any segment that could clear
-    // the 65% char-similarity threshold necessarily shares such a word, so the
-    // true best fuzzy match is always in this list. When the phrase has no
-    // distinctive words we cannot prefilter and scan all segments (old behavior).
-    const phraseWordSet = new Set(phraseWords);
-    const segmentWordLists = normSegs.map((t) => t.split(/\s+/));
-    let candidateIdx: number[];
-    if (phraseWords.length > 0) {
-      candidateIdx = [];
-      for (let i = 0; i < normSegs.length; i++) {
-        if (segmentWordLists[i].some((w) => phraseWordSet.has(w))) {
-          candidateIdx.push(i);
-        }
-      }
-      if (candidateIdx.length === 0) {
-        candidateIdx = normSegs.map((_, i) => i);
-      }
-    } else {
-      candidateIdx = normSegs.map((_, i) => i);
-    }
-
-    // Strategy 3: Fuzzy matching with Levenshtein distance over the shortlist.
-    // Compare the quote against each candidate segment and find the best match.
-    let bestFuzzyMatch: { segment: Segment; score: number } | null = null;
-
-    for (const i of candidateIdx) {
-      const normalizedText = normSegs[i];
-
-      // For longer segments, use a sliding window to find best match
-      if (normalizedText.length >= searchPhrase.length) {
-        // Check similarity of the segment prefix against the search phrase
-        const similarity = stringSimilarity(
-          searchPhrase,
-          normalizedText.substring(0, searchPhrase.length + 10), // Allow some overflow
-        );
-
-        if (similarity > FUZZY_THRESHOLD && (!bestFuzzyMatch || similarity > bestFuzzyMatch.score)) {
-          bestFuzzyMatch = { segment: segments[i], score: similarity };
-        }
-      }
-
-      // Also try matching the full normalized segment against the phrase
-      const cmpLen = Math.min(normalizedPhrase.length, normalizedText.length);
-      const fullSimilarity = stringSimilarity(
-        normalizedPhrase.substring(0, cmpLen),
-        normalizedText.substring(0, cmpLen),
-      );
-
-      if (fullSimilarity > FUZZY_THRESHOLD && (!bestFuzzyMatch || fullSimilarity > bestFuzzyMatch.score)) {
-        bestFuzzyMatch = { segment: segments[i], score: fullSimilarity };
-      }
-    }
-
-    if (bestFuzzyMatch) {
-      this.logger.debug(
-        `[Fuzzy Match] Found "${phrase.substring(0, 30)}..." at ${bestFuzzyMatch.segment.start}s (score: ${bestFuzzyMatch.score.toFixed(2)})`,
-      );
-      return bestFuzzyMatch.segment.start;
-    }
-
-    // Strategy 4: Distinctive word matching
-    // Find uncommon words in the quote and search for segments containing them
-    if (phraseWords.length > 0) {
-      let bestWordMatch: { segment: Segment; matchCount: number; fuzzyScore: number } | null = null;
-
-      for (let i = 0; i < segments.length; i++) {
-        const segment = segments[i];
-        const segmentWords = segmentWordLists[i];
-        let matchCount = 0;
-        let fuzzyMatchCount = 0;
-
-        for (const phraseWord of phraseWords) {
-          // Exact word match
-          if (segmentWords.some((sw) => sw === phraseWord || sw.includes(phraseWord) || phraseWord.includes(sw))) {
-            matchCount++;
-          } else {
-            // Fuzzy word match (for typos like "Somalies" vs "Somalis")
-            for (const segmentWord of segmentWords) {
-              if (segmentWord.length > 3 && stringSimilarity(phraseWord, segmentWord) > 0.75) {
-                fuzzyMatchCount++;
-                break;
-              }
-            }
-          }
-        }
-
-        const totalMatches = matchCount + fuzzyMatchCount * 0.8; // Fuzzy matches count slightly less
-        const score = totalMatches / phraseWords.length;
-
-        if (score > 0.4 && (!bestWordMatch || totalMatches > bestWordMatch.matchCount + bestWordMatch.fuzzyScore)) {
-          bestWordMatch = { segment, matchCount, fuzzyScore: fuzzyMatchCount * 0.8 };
-        }
-      }
-
-      if (bestWordMatch) {
-        this.logger.debug(
-          `[Word Match] Found "${phrase.substring(0, 30)}..." at ${bestWordMatch.segment.start}s (${bestWordMatch.matchCount} exact + ${bestWordMatch.fuzzyScore.toFixed(1)} fuzzy)`,
-        );
-        return bestWordMatch.segment.start;
-      }
-    }
-
-    // Strategy 5: Check across segment boundaries with fuzzy matching
-    for (let i = 0; i < segments.length - 1; i++) {
-      // normSegs[i] is already normalized; joining two normalized strings with a
-      // single space is equivalent to normalizing the concatenation.
-      const combinedText = normSegs[i] + ' ' + normSegs[i + 1];
-
-      // Try exact match first
-      if (combinedText.includes(searchPhrase)) {
-        return segments[i].start;
-      }
-
-      // Try fuzzy match on combined text
-      const similarity = stringSimilarity(
-        searchPhrase,
-        combinedText.substring(0, searchPhrase.length + 15),
-      );
-
-      if (similarity > FUZZY_THRESHOLD) {
-        this.logger.debug(
-          `[Cross-segment Fuzzy] Found "${phrase.substring(0, 30)}..." at ${segments[i].start}s (score: ${similarity.toFixed(2)})`,
-        );
-        return segments[i].start;
-      }
-    }
-
-    this.logger.debug(`[No Match] Could not find: "${phrase.substring(0, 50)}..."`);
-    return null;
   }
 
   // =============================================================================
   // TWO-PASS CHAPTER ANALYSIS METHODS
   // =============================================================================
-
-  /**
-   * PASS 1: Detect chapter boundaries using chunked processing
-   * Processes transcript in time-based chunks to find topic change points
-   */
-  private async detectChapterBoundaries(
-    config: AIProviderConfig,
-    segments: Segment[],
-    videoTitle: string,
-    limits: ModelLimits,
-    recordFailure: (what: string) => void,
-    onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
-    onChunkProgress?: (current: number, total: number) => void,
-  ): Promise<number[]> {
-    const boundaries: number[] = [0]; // First chapter always starts at 0
-    let previousTopic = '';
-
-    if (!segments || segments.length === 0) {
-      this.logger.warn('No segments available for boundary detection');
-      return boundaries;
-    }
-
-    // Calculate total video duration from segments
-    const lastSegment = segments[segments.length - 1];
-    const videoDurationSeconds = lastSegment?.end || lastSegment?.start || 0;
-
-    const chunks = this.chunkTranscript(segments, limits.chunkMinutes);
-    this.logger.log(`[Pass 1] Detecting boundaries in ${chunks.length} chunks (${limits.chunkMinutes} min each), video duration: ${Math.round(videoDurationSeconds)}s`);
-
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      const isFirst = i === 0;
-
-      const prompt = buildBoundaryDetectionPrompt(
-        videoTitle,
-        chunk.text.substring(0, limits.maxChunkChars),
-        previousTopic,
-        isFirst,
-        videoDurationSeconds,
-      );
-
-      // Try once, then retry once. A chunk that still won't produce a parseable
-      // result is a recorded failure — NOT silently dropped (its boundaries are
-      // lost, which is why it must be counted against the abort threshold).
-      let result: BoundaryDetectionResult | null = null;
-      // Capture the underlying error so a recorded failure carries the real
-      // reason (e.g. a Claude 400) rather than a generic message.
-      let lastError = '';
-      for (let attempt = 0; attempt <= 1; attempt++) {
-        try {
-          const response = await this.aiProviderService.generateText(prompt, config, 'boundary');
-          onTokens?.(response);
-          if (response && response.text) {
-            result = this.parseBoundaryResponse(response.text);
-            if (result) break;
-            this.logger.warn(`[Pass 1] Chunk ${i + 1} unparseable (attempt ${attempt + 1})`);
-          } else {
-            this.logger.warn(`[Pass 1] No response for chunk ${i + 1} (attempt ${attempt + 1})`);
-          }
-        } catch (error) {
-          lastError = (error as Error).message;
-          this.logger.warn(`[Pass 1] Error processing chunk ${i + 1} (attempt ${attempt + 1}): ${lastError}`);
-        }
-        if (attempt < 1) await this.delay(1000);
-      }
-
-      // Report after every chunk, INCLUDING failed ones. This is what keeps
-      // lastProgressAt moving during Pass 1: without it the whole pass (plus the
-      // model load in front of it) elapses at a frozen 5%, which trips the
-      // queue's stall warning on any slow model and hides a genuinely wedged
-      // Ollama behind a false positive.
-      onChunkProgress?.(i + 1, chunks.length);
-
-      if (!result) {
-        recordFailure(
-          `Pass 1 boundary detection failed for chunk ${i + 1}/${chunks.length} after retry` +
-          (lastError ? `: ${lastError}` : ''),
-        );
-        continue;
-      }
-
-      // Map phrases to timestamps
-      for (const phrase of result.boundaries) {
-        const time = this.findPhraseTimestamp(phrase, chunk.segments);
-        if (time !== null && !boundaries.includes(time)) {
-          boundaries.push(time);
-          this.logger.debug(`[Pass 1] Found boundary at ${this.formatDisplayTime(time)}: "${phrase.substring(0, 30)}..."`);
-        }
-      }
-
-      previousTopic = result.end_topic;
-      this.logger.debug(`[Pass 1] Chunk ${i + 1} end topic: "${previousTopic}"`);
-    }
-
-    // Sort boundaries by time
-    boundaries.sort((a, b) => a - b);
-    this.logger.log(`[Pass 1] Found ${boundaries.length} chapter boundaries`);
-
-    return boundaries;
-  }
-
-  /**
-   * Parse boundary detection response with robust JSON handling
-   */
-  private parseBoundaryResponse(response: string): BoundaryDetectionResult | null {
-    // Use safe JSON parsing with multiple strategies. Returns null on failure —
-    // the caller retries then records an explicit failure. A successfully parsed
-    // result with an empty boundaries array is a VALID "no topic change here"
-    // answer, not a failure.
-    const parsed = safeJsonParse<Record<string, unknown>>(response, this.logger);
-
-    if (!parsed) {
-      this.logger.warn('[Pass 1] Failed to parse boundary response - all strategies failed');
-      this.logger.debug(`[Pass 1] Raw response was: ${response.substring(0, 500)}...`);
-      return null;
-    }
-
-    // Validate the parsed result
-    const validated = validateBoundaryResult(parsed);
-
-    if (!validated) {
-      this.logger.warn('[Pass 1] Boundary response failed validation');
-      return null;
-    }
-
-    return validated;
-  }
 
   /**
    * Split boundaries to ensure no chapter exceeds the model's max chapter duration
@@ -1625,10 +1335,26 @@ export class AIAnalysisService {
       customInstructions,
     );
 
+    // Structured output is an Ollama-only lever (cloud providers ignore
+    // overrides entirely) and an explicit speed-over-quality opt-in — see
+    // FLAGS_CONSTRAINED for the measured trade. Nothing else about the call
+    // changes: same model, same temperature, same think level, same prompt.
+    const overrides =
+      config.provider === 'ollama' && FLAGS_CONSTRAINED
+        ? { format: FLAG_EXTRACTION_SCHEMA }
+        : undefined;
+    if (config.provider === 'ollama') {
+      this.logger.debug(
+        `[Pass 2b] Chapter ${chapterNumber} flag call: ${
+          overrides ? 'schema-constrained (BRIEFCASE_FLAGS_CONSTRAINED=1)' : 'free-running (default)'
+        }`,
+      );
+    }
+
     let lastError = '';
     for (let attempt = 0; attempt <= JSON_PARSE_RETRIES; attempt++) {
       try {
-        const response = await this.aiProviderService.generateText(prompt, config, 'flags');
+        const response = await this.aiProviderService.generateText(prompt, config, 'flags', overrides);
         onTokens?.(response);
 
         if (response?.text) {
@@ -1687,6 +1413,247 @@ export class AIAnalysisService {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  // ===========================================================================
+  // PASS 2b (DEFAULT): ranked-then-verified flag extraction
+  // ===========================================================================
+
+  /**
+   * Read one verdict out of a verification response.
+   *
+   * The schema-constrained decode makes the JSON reliable, but this stays
+   * tolerant on purpose: cloud providers get the same prompt with NO schema (see
+   * ai-provider.service — `format` is an Ollama-only lever), so their answer is
+   * whatever prose the model chose to wrap the verdict in.
+   *
+   * Returns null when the text carries no verdict at all; the caller treats that
+   * as 'skip' plus a warning, never as a flag. An unreadable answer must not be
+   * able to accuse anybody.
+   */
+  private parseVerificationVerdict(text: string): 'flag' | 'skip' | null {
+    if (!text) return null;
+    const json = /"verdict"\s*:\s*"(flag|skip)"/i.exec(text);
+    if (json) return json[1].toLowerCase() as 'flag' | 'skip';
+
+    const lower = text.trim().toLowerCase();
+    const hasFlag = lower.includes('flag');
+    const hasSkip = lower.includes('skip');
+    if (hasFlag && !hasSkip) return 'flag';
+    if (hasSkip && !hasFlag) return 'skip';
+    return null;
+  }
+
+  /**
+   * Merge verified sentences into sections.
+   *
+   * A speaker making one point usually spends two or three sentences on it, and
+   * the ranker scores each of them separately — so a single moment arrives here
+   * as a run of adjacent candidates in the same category. Merging that run into
+   * one section is what makes the timeline readable, and the merged span is
+   * MEASURED (first sentence's start, last sentence's end), not a fixed window.
+   *
+   * Merging is deliberately PER CATEGORY. One sentence can legitimately be two
+   * flags — a line that both demonizes and dehumanizes is genuinely both — and
+   * collapsing across categories would silently delete one of them. This is the
+   * same reason the ranker keeps every category above threshold rather than the
+   * argmax.
+   */
+  private mergeVerifiedCandidates(flagged: FlagCandidate[]): AnalyzedSection[] {
+    const byCategory = new Map<string, FlagCandidate[]>();
+    for (const candidate of flagged) {
+      const list = byCategory.get(candidate.category);
+      if (list) list.push(candidate);
+      else byCategory.set(candidate.category, [candidate]);
+    }
+
+    const sections: AnalyzedSection[] = [];
+    for (const [category, list] of byCategory) {
+      list.sort((a, b) => a.sentenceIndex - b.sentenceIndex);
+      let run: FlagCandidate[] = [];
+
+      const flush = () => {
+        if (run.length === 0) return;
+        const first = run[0];
+        const last = run[run.length - 1];
+        const text = run.map((c) => c.text).join(' ');
+        sections.push({
+          category,
+          // The verifier answers with a verdict and nothing else, so there is no
+          // generated explanation to show — and inventing one would be a
+          // fabrication. The flagged sentence IS the finding. `description` is
+          // the field the UI actually renders (analysis-panel section list and
+          // the timeline marker tooltip both bind section.description), so the
+          // quoted sentence goes there, in the same `"…"` form the discovery
+          // path produces for a quote with no reason attached.
+          description: `"${text}"`,
+          start_time: this.formatDisplayTime(first.start),
+          end_time: this.formatDisplayTime(last.end),
+          quotes: [{ timestamp: this.formatDisplayTime(first.start), text }],
+        });
+        run = [];
+      };
+
+      for (const candidate of list) {
+        const previous = run[run.length - 1];
+        const contiguous =
+          previous &&
+          (candidate.sentenceIndex <= previous.sentenceIndex + 1 || candidate.start <= previous.end);
+        if (!contiguous) flush();
+        run.push(candidate);
+      }
+      flush();
+    }
+
+    return sections.sort(
+      (a, b) => this.parseDisplayTime(a.start_time) - this.parseDisplayTime(b.start_time),
+    );
+  }
+
+  /**
+   * The DEFAULT flag path: rank every sentence, then verify each candidate.
+   *
+   * Returns null when the ranker is unavailable or its scoring call fails, which
+   * is the caller's signal to run the old chapter-discovery pass instead. It
+   * never throws for a per-candidate problem: a failed or unreadable
+   * verification is that candidate degrading to 'skip' with a warning, NOT a
+   * recordFailure — one bad HTTP call must not push a run toward
+   * TOO_MANY_FAILURES when the pipeline is making hundreds of tiny calls. A
+   * TOTAL failure (Ollama down, so every call throws) is reported to the caller
+   * the same way chapter analysis reports total failure: the run's own
+   * recordFailure, once, for the stage.
+   */
+  private async runRankedFlagStage(
+    flagConfig: AIProviderConfig,
+    segments: Segment[],
+    categories: AnalysisCategory[],
+    sensitivity: number | undefined,
+    recordFailure: (what: string) => void,
+    onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
+    onFlagProgress?: (current: number, total: number) => void,
+    onFlagStatus?: (message: string) => void,
+  ): Promise<AnalyzedSection[] | null> {
+    const sentences = assembleSentences(segments);
+    if (sentences.length === 0) {
+      this.logger.warn('[Pass 2b] No sentences could be assembled from the transcript');
+      return [];
+    }
+
+    let candidates: FlagCandidate[];
+    try {
+      onFlagStatus?.(`Ranking ${sentences.length} sentences for flag candidates...`);
+      candidates = await this.nliRanker.rankSentences(sentences, categories, sensitivity);
+    } catch (error) {
+      this.logger.warn(`[Pass 2b] NLI ranking failed: ${(error as Error).message}`);
+      return null;
+    }
+
+    const threshold = this.nliRanker.thresholdForSensitivity(sensitivity);
+    this.logger.log(
+      `[Pass 2b] Ranked ${sentences.length} sentences at threshold ${threshold} ` +
+      `(sensitivity ${normalizeSensitivity(sensitivity)}) -> ${candidates.length} candidates to verify ` +
+      `on ${flagConfig.provider}:${flagConfig.model}`,
+    );
+
+    // The candidate count is only known NOW, so this is where the run's API-call
+    // estimate gets corrected — the same mid-run recompute the chapter loop does
+    // after long chapters are split.
+    onFlagProgress?.(0, candidates.length);
+    if (candidates.length === 0) return [];
+
+    // ONE num_ctx for every verification call in the stage, sized from the
+    // largest prompt. Ollama fully reloads the model on ANY num_ctx change, and
+    // these prompts differ only by a sentence or two of context — per-call
+    // sizing would buy reloads and nothing else.
+    const prompts = candidates.map((candidate) =>
+      buildFlagVerificationPrompt(
+        candidate.text,
+        sentences
+          .slice(Math.max(0, candidate.sentenceIndex - VERIFY_CONTEXT_SENTENCES), candidate.sentenceIndex)
+          .map((s) => s.text),
+        sentences
+          .slice(candidate.sentenceIndex + 1, candidate.sentenceIndex + 1 + VERIFY_CONTEXT_SENTENCES)
+          .map((s) => s.text),
+        candidate.category,
+        candidate.proposition,
+      ),
+    );
+    const numCtx = estimateNumCtx(
+      prompts.reduce((max, prompt) => Math.max(max, prompt.length), 0),
+      flagConfig.model,
+      VERIFY_OUTPUT_BUDGET_TOKENS,
+    );
+
+    const overrides = {
+      numCtx,
+      temperature: 0,
+      // Schema on Ollama only — cloud providers ignore overrides entirely and
+      // get the same prompt as prose, parsed by parseVerificationVerdict.
+      ...(flagConfig.provider === 'ollama' ? { format: FLAG_VERIFICATION_SCHEMA } : {}),
+    };
+
+    const flagged: FlagCandidate[] = [];
+    let skipped = 0;
+    let degraded = 0;
+    const startedAt = Date.now();
+
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      try {
+        const response = await this.aiProviderService.generateText(prompts[i], flagConfig, 'flags', overrides);
+        onTokens?.(response);
+
+        if (response.doneReason === 'length') {
+          degraded++;
+          this.logger.warn(
+            `[Pass 2b] Verification hit the token ceiling at ${this.formatDisplayTime(candidate.start)} ` +
+            `(${candidate.category}) — skipping this candidate`,
+          );
+        } else {
+          const verdict = this.parseVerificationVerdict(response.text);
+          if (verdict === null) {
+            degraded++;
+            this.logger.warn(
+              `[Pass 2b] No verdict in the verification answer at ${this.formatDisplayTime(candidate.start)} ` +
+              `(${candidate.category}) — skipping this candidate`,
+            );
+          } else if (verdict === 'flag') {
+            flagged.push(candidate);
+          } else {
+            skipped++;
+          }
+        }
+      } catch (error) {
+        degraded++;
+        this.logger.warn(
+          `[Pass 2b] Verification call failed at ${this.formatDisplayTime(candidate.start)} ` +
+          `(${candidate.category}): ${(error as Error).message} — skipping this candidate`,
+        );
+      }
+      onFlagProgress?.(i + 1, candidates.length);
+    }
+
+    const wallSeconds = (Date.now() - startedAt) / 1000;
+    this.logger.log(
+      `[Pass 2b] Verified ${candidates.length} candidates in ${wallSeconds.toFixed(1)}s ` +
+      `(${(wallSeconds / candidates.length).toFixed(2)}s/call): ` +
+      `${flagged.length} flag, ${skipped} skip, ${degraded} unusable`,
+    );
+
+    // Every single call failing is a broken stage, not a quiet result. Report it
+    // ONCE — the same shape as a chapter's total failure — so the job's failure
+    // accounting sees it without being flooded by hundreds of per-call entries.
+    if (degraded === candidates.length) {
+      recordFailure(
+        `Pass 2b flag verification produced no usable verdicts across all ${candidates.length} candidates`,
+      );
+    }
+
+    const sections = this.mergeVerifiedCandidates(flagged);
+    this.logger.log(
+      `[Pass 2b] Merged ${flagged.length} verified sentences into ${sections.length} flag sections`,
+    );
+    return sections;
+  }
+
   /**
    * PASS 2: Analyze each chapter with full context
    * Generates title and summary per chapter, then runs the dedicated flag pass
@@ -1705,6 +1672,7 @@ export class AIAnalysisService {
     onChapterProgress?: (current: number, total: number) => void,
     taskModels: Partial<Record<AITaskKind, string>> = {},
     onFlagProgress?: (current: number, total: number) => void,
+    onFlagStatus?: (message: string) => void,
   ): Promise<{ chapters: Chapter[]; flags: AnalyzedSection[] }> {
     const chapters: Chapter[] = [];
     const allFlags: AnalyzedSection[] = [];
@@ -1847,10 +1815,51 @@ export class AIAnalysisService {
     // safe to separate — and separating them means each model loads once even
     // when 'flags' is routed to a different model than 'chapter'.
     // =========================================================================
+    const flagConfig = this.resolveTaskConfig(config, 'flags', taskModels);
+
+    // -------------------------------------------------------------------------
+    // FLAG PATH SELECTION. The ranked pipeline is the default; chapter discovery
+    // is the degradation path, kept intact for machines with no NLI worker
+    // environment and for `misinformation`, which entailment cannot rank.
+    // Exactly one line of the log says which ran and why.
+    // -------------------------------------------------------------------------
     if (pendingFlagWork.length > 0) {
-      const flagConfig = this.resolveTaskConfig(config, 'flags', taskModels);
+      let unavailableReason: string | null = FLAGS_DISCOVERY
+        ? 'BRIEFCASE_FLAGS_DISCOVERY=1'
+        : (await this.nliRanker.isAvailable())
+          ? null
+          : this.nliRanker.unavailable || 'NLI ranker unavailable';
+
+      if (!unavailableReason) {
+        const ranked = await this.runRankedFlagStage(
+          flagConfig,
+          segments,
+          categories,
+          analysisGranularity,
+          recordFailure,
+          onTokens,
+          onFlagProgress,
+          onFlagStatus,
+        );
+        if (ranked) {
+          this.logger.log(
+            `[Pass 2b] FLAG PATH: ranked + verified (NLI sentence ranking, one verification call per ` +
+            `candidate) — ${ranked.length} flag sections`,
+          );
+          // Returned WITHOUT the 5-second timestamp dedup below. That dedup
+          // exists to clean up after a discovery model emitting several flags
+          // for one moment, and it is category-BLIND: it would delete the second
+          // category of a sentence that legitimately matches two. This path
+          // merges per category by construction, so there is nothing left to
+          // dedup and something real to lose.
+          return { chapters, flags: ranked };
+        }
+        unavailableReason = 'NLI ranking failed mid-run';
+      }
+
       this.logger.log(
-        `[Pass 2b] Extracting flags for ${pendingFlagWork.length} chapters on ${flagConfig.provider}:${flagConfig.model} ` +
+        `[Pass 2b] FLAG PATH: chapter discovery (${unavailableReason}) — ` +
+        `extracting flags for ${pendingFlagWork.length} chapters on ${flagConfig.provider}:${flagConfig.model} ` +
         `(concurrency ${Math.min(FLAG_EXTRACTION_CONCURRENCY, pendingFlagWork.length)})`,
       );
 
@@ -1902,7 +1911,7 @@ export class AIAnalysisService {
             // Try to find the actual timestamp of the quote in the transcript
             let flagStartTime = startTime;
             if (flag.quote) {
-              const foundTime = this.findPhraseTimestamp(flag.quote, chapterSegments);
+              const foundTime = findPhraseTimestamp(flag.quote, chapterSegments, this.logger);
               if (foundTime !== null) {
                 flagStartTime = foundTime;
               } else {
@@ -2010,59 +2019,189 @@ export class AIAnalysisService {
   }
 
   /**
-   * Generate video description from chapter summaries
+   * Reject an AI refusal masquerading as content. A refusal is a real failure,
+   * never a description.
+   */
+  private isRefusal(text: string): boolean {
+    return [/^i apologize/i, /^i'm sorry/i, /^i cannot/i, /^unfortunately/i, /^as an ai/i]
+      .some((p) => p.test(text.trim()));
+  }
+
+  /**
+   * One schema-constrained call for a VIEWER-FACING prose field (hook or body),
+   * with the register check and its single re-ask.
+   *
+   * The re-ask exists because register and specificity fail independently: a
+   * perfectly specific, entity-rich line can still be written in narration
+   * register, and that is a real SEO/readability loss but not a broken result.
+   * So detection is a DECLARED WARNING worth one more attempt — never a blocking
+   * check, and never a silent code rewrite of the model's prose.
+   *
+   * The re-ask prompt is the original prompt plus a restatement of the POSITIVE
+   * instruction. Per the spec's prompt-hygiene ruling it does not quote, echo or
+   * describe the rejected text: a model shown the bad form sometimes reproduces
+   * it, which is exactly the failure we are trying to clear.
+   */
+  private async generateViewerFacingField(
+    field: 'hook' | 'body',
+    basePrompt: string,
+    schema: Record<string, unknown>,
+    config: AIProviderConfig,
+    temperature: number | undefined,
+    onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
+  ): Promise<string | null> {
+    // Ollama-only lever; cloud providers ignore overrides entirely and simply
+    // follow the same prompt's "output JSON only" instruction.
+    const overrides =
+      config.provider === 'ollama'
+        ? {
+            ...(DESCRIPTION_UNCONSTRAINED ? {} : { format: schema }),
+            ...(temperature !== undefined ? { temperature } : {}),
+          }
+        : undefined;
+
+    const runOnce = async (prompt: string): Promise<string | null> => {
+      const response = await this.aiProviderService.generateText(prompt, config, 'description', overrides);
+      onTokens?.(response);
+      const raw = (response?.text || '').trim();
+      if (!raw) return null;
+
+      // Structured mode makes the parse a formality; the raw-text fallback is
+      // for a cloud model that answered in prose despite being asked for JSON.
+      const parsed = safeJsonParse<Record<string, unknown>>(raw, this.logger);
+      const value = parsed && typeof parsed[field] === 'string' ? (parsed[field] as string) : null;
+      if (value && value.trim()) return value.trim();
+      if (!raw.startsWith('{') && !raw.startsWith('[')) return raw;
+      return null;
+    };
+
+    let text = await runOnce(basePrompt);
+    if (!text) return null;
+
+    const finding = detectNarratedActor(text);
+    if (finding.flagged) {
+      // Declared warning: the offending fragment is logged for the operator and
+      // goes nowhere near the model.
+      this.logger.warn(
+        `[Description] ${field}: narrated-actor register detected (${finding.rule}: "${finding.match}") — re-asking once`,
+      );
+      const retry = await runOnce(`${basePrompt}\n${REGISTER_RESTATEMENT}`);
+      // The second result is ACCEPTED regardless. One re-ask, then we ship what
+      // the model wrote; nothing here blocks or rewrites.
+      if (retry) {
+        const secondFinding = detectNarratedActor(retry);
+        if (secondFinding.flagged) {
+          this.logger.warn(
+            `[Description] ${field}: still narrated after one re-ask (${secondFinding.rule}) — accepting as written`,
+          );
+        }
+        text = retry;
+      }
+    }
+
+    if (this.isRefusal(text)) return null;
+    return text;
+  }
+
+  /**
+   * Build the YouTube description: two model calls (hook, body) and a
+   * code-composed template. Implements docs/youtube-metadata-spec.md §2-§3.
+   *
+   * The model writes prose and nothing else. The chapters block, the hashtag
+   * line, the ordering and the character caps are all code, because they are the
+   * parts with exact right answers — and because per §3 exactly one component
+   * may own each element, so the model is never allowed to emit a hashtag line
+   * that would then have to be reconciled with the one code builds.
+   *
+   * `tags` comes from the tags step, which runs first: its `people` list grounds
+   * the body and its `topics` feed the hook and the hashtags. A null `tags`
+   * (tags failed, or ran after this on a different routed model) degrades
+   * cleanly — the chapter summaries already carry the names.
    */
   private async generateDescriptionFromChapters(
     config: AIProviderConfig,
     chapters: Chapter[],
     videoTitle: string,
+    tags: Tags | null,
     recordFailure: (what: string) => void,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
   ): Promise<string | null> {
-    // Only summarize chapters that actually succeeded.
+    // Only describe chapters that actually succeeded.
     const validChapters = (chapters || []).filter((ch) => !ch.failed);
     if (validChapters.length === 0) {
       recordFailure('Description generation: no successfully-analyzed chapters to summarize');
       return null;
     }
 
+    if (config.provider === 'ollama') {
+      this.logger.debug(
+        `[Description] hook + body calls: ${
+          DESCRIPTION_UNCONSTRAINED
+            ? 'free-running (BRIEFCASE_DESCRIPTION_UNCONSTRAINED=1)'
+            : 'schema-constrained (default)'
+        }`,
+      );
+    }
+
     try {
-      const chaptersList = validChapters
-        .map((ch) => `${ch.sequence}. [${ch.start_time}] ${ch.title}${ch.summary ? ` - ${ch.summary}` : ''}`)
-        .join('\n');
+      const people = tags?.people?.length ? tags.people.join(', ') : 'none identified';
+      const topics = tags?.topics?.length ? tags.topics.join(', ') : 'none identified';
 
-      const prompt = interpolatePrompt(DESCRIPTION_FROM_CHAPTERS_PROMPT, {
+      // ---- Call 1: the hook. Chapter TITLES only — the hook is one sentence and
+      // the summaries would bury the searchable phrase in detail.
+      const hookPrompt = interpolatePrompt(HOOK_FROM_CHAPTERS_PROMPT, {
         videoTitle: videoTitle || 'Untitled',
-        chaptersList: chaptersList.substring(0, 4000),
+        chapterTitles: validChapters.map((ch) => `- ${ch.title}`).join('\n').substring(0, 2000),
+        topics,
       });
+      // Hook keeps the 'description' task temperature (0.4) — it needs a little
+      // life, which is exactly what that default was chosen for.
+      let hook = await this.generateViewerFacingField('hook', hookPrompt, HOOK_SCHEMA, config, undefined, onTokens);
 
-      const response = await this.aiProviderService.generateText(prompt, config, 'description');
-      onTokens?.(response);
-
-      if (response && response.text) {
-        const description = response.text.trim();
-
-        // Reject AI refusals — a refusal is a real failure, not a description.
-        const invalidPatterns = [
-          /^i apologize/i,
-          /^i'm sorry/i,
-          /^i cannot/i,
-          /^unfortunately/i,
-          /^as an ai/i,
-        ];
-        if (invalidPatterns.some((p) => p.test(description))) {
-          recordFailure(`Description generation returned an AI refusal: "${description.substring(0, 50)}..."`);
-          return null;
-        }
-
-        if (description) {
-          return description;
-        }
+      if (hook && hook.length > HOOK_MAX_CHARS) {
+        // The ONLY length enforcement — the schema deliberately has no maxLength
+        // (see HOOK_SCHEMA: Ollama enforces it by truncating mid-word). A hard
+        // display limit is never left to a model or a serializer: the snippet is
+        // truncated by YouTube either way, so we choose the cut point.
+        this.logger.warn(
+          `[Description] hook came back at ${hook.length} chars (cap ${HOOK_MAX_CHARS}) — trimming at a word boundary`,
+        );
+        hook = truncateAtWordBoundary(hook, HOOK_MAX_CHARS);
       }
 
-      // Empty/no text — an explicit failure, NOT a synthesized placeholder.
-      recordFailure('Description generation returned empty text');
-      return null;
+      // ---- Call 2: the body. ALL chapter summaries. They narrate internally and
+      // that is correct for internal data; the prompt's register instruction is
+      // what keeps that register out of the published paragraph.
+      const bodyPrompt = interpolatePrompt(BODY_FROM_CHAPTERS_PROMPT, {
+        videoTitle: videoTitle || 'Untitled',
+        people,
+        chapterSummaries: validChapters
+          .map((ch) => `${ch.title}${ch.summary ? `: ${ch.summary}` : ''}`)
+          .join('\n')
+          .substring(0, 6000),
+      });
+      const body = await this.generateViewerFacingField('body', bodyPrompt, BODY_SCHEMA, config, 0.2, onTokens);
+
+      if (!hook && !body) {
+        recordFailure('Description generation: neither the hook nor the body call produced text');
+        return null;
+      }
+      if (!hook) recordFailure('Description generation: hook call produced no usable text');
+      if (!body) recordFailure('Description generation: body call produced no usable text');
+
+      // ---- Composition: pure code from here down.
+      const description = composeDescription({
+        hook: hook || '',
+        chapterLines: buildChapterLines(validChapters),
+        body: body || '',
+        hashtags: buildHashtags(tags?.topics || [], tags?.people || [], videoTitle || ''),
+      });
+
+      if (!description.trim()) {
+        recordFailure('Description generation produced an empty composition');
+        return null;
+      }
+      return description;
     } catch (error) {
       recordFailure(`Description generation failed: ${(error as Error).message}`);
       return null;
@@ -2094,7 +2233,20 @@ export class AIAnalysisService {
         chaptersList: chaptersList.substring(0, 4000),
       });
 
-      const response = await this.aiProviderService.generateText(prompt, config, 'tags');
+      // Schema-constrained by DEFAULT (Ollama only). This is mechanical
+      // extraction from summaries — the judgment already happened upstream in
+      // chapter summarization — which is precisely the class where structured
+      // output is pure win: it pins the exact `{people, topics}` shape the parser
+      // below expects AND collapses a thinking model's output from thousands of
+      // reasoning tokens to the answer itself. The prompt, its intent and the
+      // output shape are UNCHANGED; only the decoding grammar is.
+      // BRIEFCASE_TAGS_UNCONSTRAINED=1 restores free-running decoding.
+      const overrides =
+        config.provider === 'ollama' && !TAGS_UNCONSTRAINED
+          ? { format: TAGS_EXTRACTION_SCHEMA }
+          : undefined;
+
+      const response = await this.aiProviderService.generateText(prompt, config, 'tags', overrides);
       onTokens?.(response);
 
       if (response && response.text) {

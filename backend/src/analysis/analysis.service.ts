@@ -1147,19 +1147,28 @@ export class AnalysisService implements OnModuleInit {
         if (analysisResult && analysisResult.sections && Array.isArray(analysisResult.sections)) {
           this.logger.log(`Saving ${analysisResult.sections.length} sections to database for video ${videoId}`);
 
+          // Parse a "M:SS" / "H:MM:SS" time string to seconds. Returns null for
+          // anything unparseable so callers can tell "absent" from "zero".
+          const parseSectionTime = (value: string | null | undefined): number | null => {
+            if (!value) return null;
+            const parts = value.split(':').map((p: string) => parseInt(p, 10));
+            if (parts.some((n) => !Number.isFinite(n))) return null;
+            if (parts.length === 2) return parts[0] * 60 + parts[1];
+            if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+            return null;
+          };
+
           for (const section of analysisResult.sections) {
-            // Parse time string like "0:42" or "1:23:45" to seconds
-            let startSeconds = 0;
-            if (section.start_time) {
-              const parts = section.start_time.split(':').map((p: string) => parseInt(p));
-              if (parts.length === 2) {
-                // M:SS format
-                startSeconds = parts[0] * 60 + parts[1];
-              } else if (parts.length === 3) {
-                // H:MM:SS format
-                startSeconds = parts[0] * 3600 + parts[1] * 60 + parts[2];
-              }
-            }
+            const startSeconds = parseSectionTime(section.start_time) ?? 0;
+
+            // Honor the section's OWN end time when it has one. The ranked flag
+            // path merges a run of flagged sentences into one section and its end
+            // is measured (the last sentence's end), so overwriting it with a
+            // fixed 10-second window would throw away the real span. The 10s
+            // default remains for sections that carry no usable end.
+            const parsedEnd = parseSectionTime(section.end_time);
+            const endSeconds =
+              parsedEnd !== null && parsedEnd > startSeconds ? parsedEnd : startSeconds + 10;
 
             // Only insert sections that have a valid category (skip uncategorized)
             if (section.category) {
@@ -1167,7 +1176,7 @@ export class AnalysisService implements OnModuleInit {
                 id: require('uuid').v4(),
                 videoId,
                 startSeconds,
-                endSeconds: startSeconds + 10, // Default 10 second duration
+                endSeconds,
                 timestampText: section.start_time,
                 title: section.description ? section.description.substring(0, 100) : undefined,
                 description: section.description,

@@ -26,6 +26,53 @@ export interface AIResponse {
   estimatedCost?: number;
   provider: string;
   model: string;
+  /**
+   * Ollama's `done_reason`. 'length' means the generation was CUT OFF at the
+   * num_predict ceiling, so the text is a fragment — callers that need a
+   * complete answer (a verbatim quote, a JSON object) must treat it as a failed
+   * call rather than parse the fragment. Absent for non-Ollama providers.
+   */
+  doneReason?: string;
+}
+
+/**
+ * Per-call overrides for the Ollama path. Both exist for stages that make a RUN
+ * of near-identical calls and need them to behave identically; other providers
+ * ignore them.
+ */
+export interface AIGenerateOverrides {
+  /**
+   * Fixed num_ctx for the whole run, instead of per-call estimation. Ollama
+   * fully reloads the model on any num_ctx change, so a stage whose prompts vary
+   * slightly in size sizes ONCE from its largest prompt and passes it here.
+   */
+  numCtx?: number;
+  /**
+   * Ollama structured-output mode — constrains decoding to valid JSON.
+   *
+   * `'json'` is free-form JSON. An OBJECT is a full JSON Schema, passed through
+   * verbatim as Ollama's `format` field, which constrains decoding to exactly
+   * that shape (keys, types, required fields). The schema form is strictly
+   * stronger: besides guaranteeing the parse, it collapses a thinking model's
+   * output from thousands of reasoning tokens to the answer itself, because the
+   * grammar admits nothing else.
+   */
+  format?: 'json' | Record<string, unknown>;
+  /**
+   * Sampling temperature for THIS call, overriding the per-task default.
+   *
+   * `temperatureForTask` is per TASK, but one task can contain calls that want
+   * different settling: the description task makes a hook call that wants a
+   * little life (the task default, 0.4) and a body call that wants near-greedy
+   * prose (0.2) — see docs/youtube-metadata-spec.md §5. Rather than splitting the
+   * task kind in two (which would fragment `taskModels` routing users already
+   * configure), the odd call out passes its own value.
+   *
+   * Applies to the ollama and local paths. Cloud providers deliberately send NO
+   * sampling params at all (newer Claude/OpenAI models 400 on them), so this is
+   * ignored there — same as `format`.
+   */
+  temperature?: number;
 }
 
 @Injectable()
@@ -132,10 +179,12 @@ export class AIProviderService {
     prompt: string,
     config: AIProviderConfig,
     task?: AITaskKind,
+    overrides?: AIGenerateOverrides,
   ): Promise<AIResponse> {
     this.logger.log(`Generating text with provider: ${config.provider}, model: ${config.model}, task: ${task ?? 'unspecified'}`);
 
-    const temperature = temperatureForTask(task);
+    // Per-task default, unless this particular call asked for its own.
+    const temperature = overrides?.temperature ?? temperatureForTask(task);
 
     switch (config.provider) {
       case 'local':
@@ -147,7 +196,7 @@ export class AIProviderService {
         // Cloud providers get NO sampling params (see generateWithOpenAI).
         return this.generateWithOpenAI(prompt, config);
       case 'ollama':
-        return this.generateWithOllama(prompt, config, temperature, task);
+        return this.generateWithOllama(prompt, config, temperature, task, overrides);
       default:
         throw new Error(`Unsupported AI provider: ${config.provider}`);
     }
@@ -293,6 +342,7 @@ export class AIProviderService {
     config: AIProviderConfig,
     temperature: number,
     task?: AITaskKind,
+    overrides?: AIGenerateOverrides,
   ): Promise<AIResponse> {
     const ollamaEndpoint = config.ollamaEndpoint || 'http://localhost:11434';
 
@@ -312,7 +362,10 @@ export class AIProviderService {
     // Bucketed, model-size-capped num_ctx: the old 131072 cap would allocate a
     // full 128K KV cache and spill any real model to CPU. Bucketing avoids the
     // full-model reload Ollama does on every num_ctx change.
-    const numCtx = estimateNumCtx(prompt.length, config.model, numPredict);
+    // A caller running a batch of same-shaped calls may pin num_ctx for the whole
+    // batch (it sizes from its largest prompt), which avoids the reload Ollama
+    // does whenever num_ctx changes.
+    const numCtx = overrides?.numCtx ?? estimateNumCtx(prompt.length, config.model, numPredict);
 
     this.logger.debug(
       `Ollama request: model=${config.model}, num_ctx=${numCtx}, num_predict=${numPredict}, ` +
@@ -352,6 +405,8 @@ export class AIProviderService {
             // Per-call keep_alive keeps the model resident across the whole job
             // without needing an out-of-band ping timer.
             keep_alive: '5m',
+            // Structured output, when the caller needs the answer to parse.
+            ...(overrides?.format ? { format: overrides.format } : {}),
             ...fields,
             options: {
               num_ctx: numCtx,
@@ -380,7 +435,30 @@ export class AIProviderService {
 
       // Read ONLY the `response` field — never concatenate `thinking`. Defensively
       // strip any inline <think>…</think> for models whose template inlines it.
-      const text = stripThinkTags(typeof data.response === 'string' ? data.response : '');
+      let text = stripThinkTags(typeof data.response === 'string' ? data.response : '');
+
+      // STRUCTURED-OUTPUT TRAP, measured on Ollama with qwen3.8:27b:
+      // when `format: 'json'` is sent to a THINKING model, the JSON grammar
+      // constrains the whole output stream from the first token, so the model
+      // never opens an answer channel — the object it emits is classified as
+      // reasoning and arrives in `thinking` with `response` EMPTY:
+      //   format+think:low -> eval_count 29,  response "",  thinking '{"quote": ...}'
+      //   think:low alone  -> eval_count 261, response '{"quote": ...}'
+      // The constrained call is both correct and ~5x cheaper, so it is worth
+      // keeping: when structured output was REQUESTED and `response` came back
+      // empty, the object in `thinking` is the answer. This is deliberately
+      // narrow — no format, or a non-empty `response`, and `thinking` is still
+      // never read, because then it really is reasoning prose.
+      // A JSON SCHEMA in `format` constrains the stream even harder than
+      // `'json'` does, so this fallback matters MORE there, not less.
+      if (!text && overrides?.format && typeof data.thinking === 'string' && data.thinking.trim()) {
+        text = stripThinkTags(data.thinking);
+        this.logger.debug(
+          `Ollama returned the structured (${
+            typeof overrides.format === 'string' ? overrides.format : 'schema'
+          }) answer in the thinking field (empty response) — using it`,
+        );
+      }
 
       // Ollama returns token counts: prompt_eval_count (input), eval_count (output)
       const inputTokens = data.prompt_eval_count || 0;
@@ -399,6 +477,9 @@ export class AIProviderService {
         estimatedCost: 0, // Local models are free
         provider: 'ollama',
         model: config.model,
+        // Surfaced so callers can reject a truncated answer instead of parsing
+        // a fragment of one (done_reason === 'length').
+        doneReason: typeof data.done_reason === 'string' ? data.done_reason : undefined,
       };
     } catch (error) {
       // A cancelled generation during shutdown is expected, not a fault.
