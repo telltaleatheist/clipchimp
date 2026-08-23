@@ -123,7 +123,7 @@ export interface AnalysisOptions {
   segments: Segment[];
   outputFile: string;
   customInstructions?: string;
-  analysisGranularity?: number; // 1-3: 1 = strong matches only, 3 = aggressive
+  analysisGranularity?: number; // 1-5: 1 = strong matches only, 5 = flag everything plausible
   videoTitle?: string;
   categories?: AnalysisCategory[];
   apiKey?: string;

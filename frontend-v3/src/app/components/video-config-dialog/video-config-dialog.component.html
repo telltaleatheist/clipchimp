@@ -216,13 +216,13 @@
                     <input
                       type="range"
                       min="1"
-                      max="3"
+                      max="5"
                       step="1"
                       [(ngModel)]="settings.analysisGranularity"
                       (change)="onGranularityChange()"
                       class="granularity-slider"
                     />
-                    <span class="slider-label-right">Aggressive</span>
+                    <span class="slider-label-right">Flag everything</span>
                   </div>
                   <div class="granularity-description">
                     {{ getGranularityDescription() }}

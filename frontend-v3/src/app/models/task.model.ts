@@ -36,7 +36,7 @@ export type AnalysisQuality = 'fast' | 'thorough';
 export interface AIAnalyzeConfig {
   aiModel?: string; // Dynamic model string like "ollama:qwen2.5:7b" or "claude:claude-3-sonnet"
   customInstructions?: string;
-  analysisGranularity?: number; // 1-3: 1 = strong matches only, 3 = aggressive
+  analysisGranularity?: number; // 1-5: 1 = strong matches only, 5 = flag everything plausible
   generateSummary?: boolean;
   extractKeyPoints?: boolean;
   analysisQuality?: AnalysisQuality; // 'fast' = single-pass (cheaper), 'thorough' = multi-pass (better quotes)

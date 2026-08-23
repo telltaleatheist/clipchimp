@@ -304,10 +304,45 @@ const MISINFORMATION_EXCLUSION =
  *                                   analysis-prompts.ts) — a longer candidate
  *                                   list answered by the same hard grader is
  *                                   only half a dial.
+ *   4 (very aggressive)      0.35 — "flagging things left and right".
+ *   5 (flag everything       0.2  — the bottom of the useful range. deberta
+ *      plausible)                   scores are strongly bimodal on this
+ *                                   material: below ~0.15 essentially nothing
+ *                                   is a near-miss, it is the model saying no,
+ *                                   so a lower threshold stops ranking and
+ *                                   starts forwarding the transcript.
  *
- * Cost scales with this dial, because every candidate is one verifier call.
+ * 4 AND 5 DIFFER FROM 3 BY DEGREE, NOT BY KIND. The verifier still answers every
+ * single candidate — nothing is ever flagged without a verdict, at any setting.
+ * What moves is how far down the ranked list the verifier is asked to read, how
+ * wide the rescue rule reaches, and how strongly the verifier is told to lean
+ * toward "flag" when a passage is plausible but not unmistakable.
+ *
+ * Cost scales with this dial, because every (window, category) pair is one
+ * verifier call. MEASURED on the two reference videos, 27b verifier at ~3s a
+ * call, with the merged-window step in place — candidates / verify calls /
+ * stored sections:
+ *
+ *              watters (12 min, 159 sentences)   hank (60 min, 801 sentences)
+ *   s2  0.7      72 /  56 / 11                     79 /  67 / 13   (4m34s)
+ *   s3  0.5      89 /  67 / 12                    107 /  90 / 19   (6m12s)
+ *   s4  0.35     95 /  69 / -                     134 / 111 / 22   (7m33s)
+ *   s5  0.2     119 /  83 / 16                    164 / 134 / 27   (9m13s)
+ *
+ * The ramp is real but SUBLINEAR in the threshold, and the reason is worth
+ * knowing before anyone tunes these numbers: the scores are bimodal, so dropping
+ * the bar from 0.5 to 0.2 adds far fewer candidates than the interval suggests,
+ * and windowing then merges many of the new ones into passages that were already
+ * going to be verified. Sensitivity 5 costs roughly twice sensitivity 2 on the
+ * long video, not ten times.
  */
-const THRESHOLD_BY_SENSITIVITY: Record<1 | 2 | 3, number> = { 1: 0.9, 2: 0.7, 3: 0.5 };
+const THRESHOLD_BY_SENSITIVITY: Record<1 | 2 | 3 | 4 | 5, number> = {
+  1: 0.9,
+  2: 0.7,
+  3: 0.5,
+  4: 0.35,
+  5: 0.2,
+};
 
 /**
  * VERIFICATION WINDOWS — the parameters that turn hot sentences into passages.
@@ -371,8 +406,43 @@ const WINDOW_MAX_MERGED_SECONDS = 40;
  * Adding near-threshold categories to already-hot sentences would add
  * verification calls — the opposite of what this change is for — and would let
  * a weak category attach itself to a strong sentence.
+ *
+ * THE MARGIN WIDENS WITH THE DIAL. 0.15 is kept byte-identical at sensitivities
+ * 1-3, where it is the measured value; it widens to 0.20 at 4 and 0.25 at 5,
+ * because at those settings corroboration is exactly the kind of weak-but-real
+ * evidence the operator has asked to see.
+ *
+ * ...BUT THE FLOOR IT REACHES DOWN TO IS CLAMPED, and that clamp is load-bearing.
+ * The rule's floor is `threshold - margin`, and at sensitivity 5 that arithmetic
+ * is 0.2 - 0.25 = -0.05: a NEGATIVE floor, which every score in the matrix
+ * clears. MEASURED on the first run of the widened dial, before the clamp
+ * existed: on the 12-minute reference video every one of the 159 sentences was
+ * "rescued" on all 10 categories at scores of 0.000-0.008, which is not
+ * corroboration, it is forwarding the transcript — ~1600 verifier calls on the
+ * short video and roughly 8000 (about seven hours on the 27b) on the long one.
+ *
+ * So the floor never goes below RESCUE_MIN_SCORE. Two categories at 0.001 are
+ * not two hypotheses nearly entailing a sentence; they are two hypotheses that
+ * both said no. The rule only means anything while its floor sits somewhere a
+ * near-miss can actually land, and 0.15 is the lowest score on these reference
+ * videos that ever coincided with real content. In practice this makes the
+ * effective floor 0.35 at sensitivity 3, and 0.15 at both 4 and 5 — still a
+ * real widening (the band at 4 and 5 is everything from 0.15 up to the
+ * threshold), just not an unbounded one.
+ *
+ * MEASURED, and worth knowing before reading a log: the 0.15 margin at
+ * sensitivities 1-3 has NEVER fired on either reference video. Every rescue is
+ * logged individually with the floor it used, so the first run where the rule
+ * does fire says so explicitly.
  */
-const RESCUE_MARGIN = 0.15;
+const RESCUE_MARGIN_BY_SENSITIVITY: Record<1 | 2 | 3 | 4 | 5, number> = {
+  1: 0.15,
+  2: 0.15,
+  3: 0.15,
+  4: 0.2,
+  5: 0.25,
+};
+const RESCUE_MIN_SCORE = 0.15;
 const RESCUE_MIN_CATEGORIES = 2;
 
 /**
@@ -699,6 +769,21 @@ export class NliRankerService implements OnApplicationShutdown {
   }
 
   /**
+   * The score a near-miss category must reach to corroborate at this
+   * sensitivity: the threshold less this level's rescue margin, but never below
+   * RESCUE_MIN_SCORE — see the RESCUE_MARGIN_BY_SENSITIVITY comment for the
+   * measured reason that clamp exists. Exposed alongside the threshold so a
+   * run's log can state both numbers.
+   */
+  rescueFloorForSensitivity(sensitivity: number | undefined): number {
+    const level = normalizeSensitivity(sensitivity);
+    return Math.max(
+      THRESHOLD_BY_SENSITIVITY[level] - RESCUE_MARGIN_BY_SENSITIVITY[level],
+      RESCUE_MIN_SCORE,
+    );
+  }
+
+  /**
    * The (category -> hypotheses, proposition) plan for this run.
    *
    * Disabled categories are dropped. `misinformation` is dropped even when
@@ -948,13 +1033,19 @@ export class NliRankerService implements OnApplicationShutdown {
   ): Promise<FlagCandidate[]> {
     const plan = this.buildPlan(categories);
     if (plan.length === 0 || sentences.length === 0) return [];
-    return this.scoreSentenceLevel(sentences, plan, this.thresholdForSensitivity(sensitivity));
+    return this.scoreSentenceLevel(
+      sentences,
+      plan,
+      this.thresholdForSensitivity(sensitivity),
+      this.rescueFloorForSensitivity(sensitivity),
+    );
   }
 
   private async scoreSentenceLevel(
     sentences: RankedSentence[],
     plan: RankPlan[],
     threshold: number,
+    rescueFloor: number = THRESHOLD_BY_SENSITIVITY[2] - RESCUE_MARGIN_BY_SENSITIVITY[2],
   ): Promise<FlagCandidate[]> {
     const { texts: hypotheses, owner } = flattenHypotheses(plan);
     const raw = await this.score(
@@ -994,7 +1085,7 @@ export class NliRankerService implements OnApplicationShutdown {
         const near: FlagCandidate[] = [];
         for (let c = 0; c < plan.length; c++) {
           const score = row[c] ?? 0;
-          if (score >= threshold - RESCUE_MARGIN) near.push(make(i, c, score, true));
+          if (score >= rescueFloor) near.push(make(i, c, score, true));
         }
         if (near.length >= RESCUE_MIN_CATEGORIES) {
           near.sort((a, b) => b.score - a.score);
@@ -1003,7 +1094,8 @@ export class NliRankerService implements OnApplicationShutdown {
           this.logger.log(
             `[NLI] RESCUED ${sentences[i].start.toFixed(1)}s on ${near.length} corroborating categories ` +
             `(${near.map((n) => `${n.category} ${n.score.toFixed(3)}`).join(', ')}) — ` +
-            `none reached ${threshold}, all within ${RESCUE_MARGIN}: "${sentences[i].text.slice(0, 90)}"`,
+            `none reached ${threshold}, all at or above the rescue floor ${rescueFloor.toFixed(2)}: ` +
+            `"${sentences[i].text.slice(0, 90)}"`,
           );
         }
       }
@@ -1015,7 +1107,8 @@ export class NliRankerService implements OnApplicationShutdown {
     this.logger.log(
       `[NLI] Sentence pass: ${sentences.length} sentences x ${plan.length} categories ` +
       `at threshold ${threshold} -> ${candidates.length} candidates ` +
-      `(${rescuedSentences} sentence(s) rescued on 2+ near-threshold categories)`,
+      `(${rescuedSentences} sentence(s) rescued on 2+ categories at or above the rescue floor ` +
+      `${rescueFloor.toFixed(2)})`,
     );
     return candidates;
   }
@@ -1132,8 +1225,9 @@ export class NliRankerService implements OnApplicationShutdown {
     const plan = this.buildPlan(categories);
     if (plan.length === 0 || sentences.length === 0) return [];
     const threshold = this.thresholdForSensitivity(sensitivity);
+    const rescueFloor = this.rescueFloorForSensitivity(sensitivity);
 
-    const sentenceLevel = await this.scoreSentenceLevel(sentences, plan, threshold);
+    const sentenceLevel = await this.scoreSentenceLevel(sentences, plan, threshold, rescueFloor);
     const windowLevel = await this.scoreWindowLevel(sentences, plan, threshold, sentenceLevel);
     const candidates = [...sentenceLevel, ...windowLevel].sort(
       (a, b) => a.spanFrom - b.spanFrom || a.spanTo - b.spanTo,

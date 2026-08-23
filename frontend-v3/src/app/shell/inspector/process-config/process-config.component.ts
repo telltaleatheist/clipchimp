@@ -342,18 +342,19 @@ export class ProcessConfigComponent {
     void this.loadInstructionsHistory();
   }
 
-  // Detection sensitivity (analysisGranularity, 1..3) -------------------------
+  // Detection sensitivity (analysisGranularity, 1..5) -------------------------
 
   granularityLoading = signal(false);
   granularityError = signal(false);
 
-  // Legacy configs stored a 1-10 value; fold those onto the 1-3 scale so the
-  // slider doesn't sit pinned at max after the migration.
+  // Mirrors normalizeSensitivity in the backend's analysis-prompts.ts, and must
+  // stay in step with it. Only a value of 6 or more is unambiguously from the
+  // old 1-10 dial, so only those are folded; 4 and 5 are read as the new scale.
   granularityValue = computed(() => {
     const raw = Number(this.config('ai-analyze')['analysisGranularity'] ?? 2);
     if (!Number.isFinite(raw)) return 2;
-    if (raw > 3) return raw <= 7 ? 2 : 3;
-    return Math.min(3, Math.max(1, Math.round(raw)));
+    if (raw > 5) return raw <= 7 ? 2 : 3;
+    return Math.min(5, Math.max(1, Math.round(raw)));
   });
   granularityLabel = computed(() => this.getGranularityLabel(this.granularityValue()));
   granularityDescription = computed(() => this.getGranularityDescription(this.granularityValue()));
@@ -361,13 +362,17 @@ export class ProcessConfigComponent {
   getGranularityLabel(value: number): string {
     if (value <= 1) return 'Strong matches only';
     if (value === 2) return 'Balanced';
-    return 'Aggressive';
+    if (value === 3) return 'Aggressive';
+    if (value === 4) return 'Very aggressive';
+    return 'Flag everything plausible';
   }
 
   getGranularityDescription(value: number): string {
     if (value <= 1) return 'Only explicit, unmistakable matches. Fewest false positives.';
     if (value === 2) return 'Clear matches plus reasonably likely ones.';
-    return 'Everything that could match, including implication and coded language. Expect more to review.';
+    if (value === 3) return 'Everything that could match, including implication and coded language. Expect more to review.';
+    if (value === 4) return 'Adds partial and implied matches on top of that. Expect a lot more to review, and a slower analysis.';
+    return 'Anything a passage could plausibly be. The most to review, and the slowest analysis.';
   }
 
   /** Load the saved default sensitivity (surfaced with retry — never silent). */

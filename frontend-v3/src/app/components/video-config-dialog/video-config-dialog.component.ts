@@ -124,14 +124,18 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
     const value = this.settings.analysisGranularity || 2;
     if (value <= 1) return 'Strong matches only';
     if (value === 2) return 'Balanced';
-    return 'Aggressive';
+    if (value === 3) return 'Aggressive';
+    if (value === 4) return 'Very aggressive';
+    return 'Flag everything plausible';
   }
 
   getGranularityDescription(): string {
     const value = this.settings.analysisGranularity || 2;
     if (value <= 1) return 'Only explicit, unmistakable matches. Fewest false positives.';
     if (value === 2) return 'Clear matches plus reasonably likely ones.';
-    return 'Everything that could match, including implication and coded language. Expect more to review.';
+    if (value === 3) return 'Everything that could match, including implication and coded language. Expect more to review.';
+    if (value === 4) return 'Adds partial and implied matches on top of that. Expect a lot more to review, and a slower analysis.';
+    return 'Anything a passage could plausibly be. The most to review, and the slowest analysis.';
   }
 
   getAudioLevelLabel(): string {

@@ -218,24 +218,35 @@ Output exactly this shape and nothing else:
 // optionally detects category flags within the chapter's content.
 
 /**
- * Coerce a stored sensitivity value onto the 1-3 scale.
+ * Coerce a stored sensitivity value onto the 1-5 scale.
  *
- * The dial used to be 1-10 (<=3 strict, <=7 balanced, >7 broad). A value above
- * 3 can only have come from that old scale, so it is mapped onto the bucket it
- * used to select. Values of 1-3 are ambiguous between the two scales and are
- * read as the NEW scale — the practical cost is that a legacy "3" (strict) now
- * reads as "aggressive", which surfaces extra flags for review rather than
- * silently hiding any. Erring toward recall is the right failure direction here.
+ * SCALE HISTORY. The dial was 1-10 (<=3 strict, <=7 balanced, >7 broad), then
+ * 1-3, and is now 1-5. Only a value of 6 or more is UNAMBIGUOUSLY from the 1-10
+ * scale, so those are still folded onto the bucket that scale selected:
+ * 6-7 -> 2 (balanced), 8-10 -> 3 (broad).
+ *
+ * VALUES 4 AND 5 ARE NOW VALID NEW-SCALE VALUES, deliberately. On the old 1-10
+ * scale a 4 or a 5 meant "balanced"; read as the new scale it means "very
+ * aggressive" or "flag everything plausible". That reinterpretation is accepted
+ * for two reasons. First, the 1-3 scale shipped this week and every stored dial
+ * value was normalized onto 1-3 the first time it was read, so a stored 4 or 5
+ * is overwhelmingly likely to be a deliberate new-scale choice rather than a
+ * legacy leftover. Second, the failure is in the safe direction: a legacy value
+ * misread upward produces MORE candidates, all of which a human reviews and can
+ * discard, whereas misreading downward would silently hide content. The whole
+ * pipeline is built on the assumption that a miss is the expensive error.
+ *
+ * Values 1-3 keep exactly the reading they have always had.
  */
-export function normalizeSensitivity(value: number | undefined | null): 1 | 2 | 3 {
+export function normalizeSensitivity(value: number | undefined | null): 1 | 2 | 3 | 4 | 5 {
   if (typeof value !== 'number' || !Number.isFinite(value)) return 2;
-  if (value > 3) return value <= 7 ? 2 : 3; // legacy 1-10 value
+  if (value > 5) return value <= 7 ? 2 : 3; // unambiguously a legacy 1-10 value
   const rounded = Math.round(value);
-  return (rounded < 1 ? 1 : rounded > 3 ? 3 : rounded) as 1 | 2 | 3;
+  return (rounded < 1 ? 1 : rounded > 5 ? 5 : rounded) as 1 | 2 | 3 | 4 | 5;
 }
 
 /**
- * Map the 1-3 sensitivity dial onto a flagging-threshold block.
+ * Map the 1-5 sensitivity dial onto a flagging-threshold block.
  *
  * The PROMOTING-vs-DEBUNKING guard is deliberately NOT part of this scale — it
  * lives in the flag rulebook and applies identically at every level, because a
@@ -249,6 +260,11 @@ export function normalizeSensitivity(value: number | undefined | null): 1 | 2 | 
  *       euphemism, with an explicit instruction to be exhaustive rather than
  *       selective. Recall over precision, on the assumption that a human
  *       reviews every flag and would rather discard a few than miss one.
+ *   4 - very aggressive: 3, plus partial matches and claims carried only by
+ *       implication, on the same reviewer assumption stated more strongly.
+ *   5 - flag everything plausible: the quote earns a flag unless it clearly is
+ *       not an instance of the category, or the speaker is clearly opposing or
+ *       reporting it. Uncertainty resolves toward flagging.
  */
 function getSensitivityLine(sensitivity: number): string {
   switch (normalizeSensitivity(sensitivity)) {
@@ -259,6 +275,19 @@ function getSensitivityLine(sensitivity: number): string {
 - Be exhaustive, not selective. List every qualifying quote in the chapter even if there are many; do not stop at the most obvious two or three, and never merge several separate moments into one flag.
 - Include borderline cases, euphemism, coded language, and claims advanced by implication rather than stated outright. If a reviewer would plausibly want to see it, flag it.
 - Recall matters more than precision at this setting. A human reviews every flag and can discard the weak ones; a missed quote is the expensive error.
+- This does NOT relax the test above. The speaker must still be advancing the claim rather than debunking it, and the quote must still be verbatim.`;
+    case 4:
+      return `Sensitivity: VERY AGGRESSIVE. Find every quote that could belong to a category, including the partial ones.
+- Be exhaustive, not selective. List every qualifying quote in the chapter even if there are many; do not stop at the most obvious two or three, and never merge several separate moments into one flag.
+- Flag a quote when it matches a category even partially, or by implication, euphemism, coded language, or clear insinuation. A quote that carries only part of the category still belongs in the list.
+- A person reviews every flag before it is used, and a quote that is not flagged is never reviewed. A missed quote is the expensive error; an extra one costs a moment of a reviewer's time.
+- This does NOT relax the test above. The speaker must still be advancing the claim rather than debunking it, and the quote must still be verbatim.`;
+    case 5:
+      return `Sensitivity: FLAG EVERYTHING PLAUSIBLE. Find every quote a reviewer could plausibly want to see.
+- Be exhaustive, not selective. List every qualifying quote in the chapter even if there are many; do not stop at the most obvious two or three, and never merge several separate moments into one flag.
+- Flag a quote whenever it could be an instance of the category — stated outright, in part, by implication, in euphemism, or in coded language. When you are genuinely uncertain whether a quote belongs, flag it.
+- Leave a quote out only when it clearly is not an instance of any category, or when the speaker is clearly opposing the claim or reporting that other people make it.
+- A person reviews every flag before it is used, and a quote that is not flagged is never reviewed. A missed quote is the expensive error; an extra one costs a moment of a reviewer's time.
 - This does NOT relax the test above. The speaker must still be advancing the claim rather than debunking it, and the quote must still be verbatim.`;
     default:
       return 'Sensitivity: balanced. Flag clear matches and reasonably likely ones; skip vague or tangential cases.';
@@ -372,28 +401,59 @@ ${chapterText}`;
 /**
  * The sensitivity dial, applied to the VERIFIER as one extra sentence.
  *
- * The ranker's half of the dial is a threshold (0.9 / 0.7 / 0.5) that decides
- * which passages get asked about at all. That decides what is ASKED; it says
- * nothing about how strictly the answer is judged, and until now the verifier
- * asked with identical strictness at every setting — so turning the dial to 3
- * bought a longer candidate list answered by the same hard grader. This is the
- * dial's second half: what the verifier does with a passage that plausibly, but
- * not unmistakably, asserts the claim.
+ * The ranker's half of the dial is a threshold (0.9 / 0.7 / 0.5 / 0.35 / 0.2)
+ * that decides which passages get asked about at all. That decides what is
+ * ASKED; it says nothing about how strictly the answer is judged, and until now
+ * the verifier asked with identical strictness at every setting — so turning the
+ * dial up bought a longer candidate list answered by the same hard grader. This
+ * is the dial's second half: what the verifier does with a passage that
+ * plausibly, but not unmistakably, asserts the claim.
+ *
+ * THE VERIFIER IS NEVER BYPASSED. Every level, including 5, asks the same
+ * question about every candidate; the clause below only changes where the
+ * answer leans. Levels 4 and 5 lean progressively harder toward "flag", which
+ * is what "flagging things left and right" means here — a much longer candidate
+ * list from the ranker, still judged one passage at a time.
  *
  * Sensitivity 2 adds NOTHING. It is the measured configuration (10/10 recall on
  * the hand audit, 0 extras) and every word added to a prompt moves a model, so
- * the calibrated setting keeps the calibrated prompt.
+ * the calibrated setting keeps the calibrated prompt. 1 and 3 are byte-identical
+ * to what they were before the scale was widened, for the same reason.
  *
- * Both clauses are POSITIVE instructions per the hygiene ruling in
+ * THE REPORT-VS-ASSERT GUARD SURVIVES EVERY LEVEL. It is the #1 correctness axis
+ * for this use case — the operator's own counter-apologetics commentary must
+ * never flag itself for quoting the thing it criticizes — so even the level-5
+ * clause, which resolves genuine uncertainty toward "flag", keeps "clearly
+ * opposing the claim or reporting that other people make it" as an explicit
+ * reason to answer "skip". MEASURED on the 27b: at sensitivity 5 the reference
+ * passage at 03:12 of the political video ("The president and Republicans have
+ * been very eager to paint the entire Democratic party as communists and
+ * Marxists") still verifies as "skip" on BOTH categories it fires
+ * (political-demonization and hate) and lands in no stored section, exactly as
+ * it does at sensitivity 2.
+ *
+ * Every clause is a POSITIVE instruction per the hygiene ruling in
  * docs/youtube-metadata-spec.md §6.1 — they say which verdict to reach for, not
- * which mistake to avoid, and neither carries an example.
+ * which mistake to avoid, and none carries an example.
  */
-const VERIFICATION_EMPHASIS: Record<1 | 2 | 3, string> = {
+const VERIFICATION_EMPHASIS: Record<1 | 2 | 3 | 4 | 5, string> = {
   1: 'Reserve "flag" for passages where the speaker states the claim outright as their own position.',
   2: '',
   3:
     'A person reviews every flag before it is used, and a passage that is not flagged is never reviewed. ' +
     'When the passage plausibly asserts the claim, answer "flag".',
+  4:
+    'A person reviews every flag before it is used, and a passage that is not flagged is never reviewed, ' +
+    'so a missed passage is the expensive error and an extra one costs a moment of review. ' +
+    'Answer "flag" when the passage plausibly matches the claim, including a partial match and a match ' +
+    'carried by implication rather than stated outright.',
+  5:
+    'A person reviews every flag before it is used, and a passage that is not flagged is never reviewed, ' +
+    'so a missed passage is the expensive error and an extra one costs a moment of review. ' +
+    'Answer "flag" whenever the passage could be an instance of the claim, in whole or in part, stated ' +
+    'outright or carried by implication. Reserve "skip" for passages that clearly do not match the claim ' +
+    'and for passages where the speaker is clearly opposing the claim or reporting that other people make ' +
+    'it. When you are genuinely uncertain, answer "flag".',
 };
 
 /**

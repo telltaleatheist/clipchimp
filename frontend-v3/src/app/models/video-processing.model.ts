@@ -30,7 +30,7 @@ export interface VideoJobSettings {
   aiAnalysis: boolean;
   aiModel?: string; // Full model ID from available models
   customInstructions?: string;
-  analysisGranularity?: number; // 1-3: 1 = strong matches only, 3 = aggressive (flag everything that could match)
+  analysisGranularity?: number; // 1-5: 1 = strong matches only, 5 = flag everything plausible
   analysisQuality?: 'fast' | 'thorough'; // fast = single-pass (cheaper), thorough = multi-pass (better)
   outputFormat?: 'mp4' | 'webm' | 'mov' | 'avi';
   outputQuality?: 'low' | 'medium' | 'high' | 'ultra';

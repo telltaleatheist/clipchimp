@@ -362,7 +362,7 @@ export class ConfigController implements OnModuleInit {
         config = JSON.parse(configData);
       }
 
-      // Update default sensitivity (clamp to the 1-3 scale)
+      // Update default sensitivity (clamp to the 1-5 scale)
       const granularity = normalizeSensitivity(body.granularity);
       config.defaultGranularity = granularity;
       config.lastUpdated = new Date().toISOString();
@@ -395,7 +395,7 @@ export class ConfigController implements OnModuleInit {
 
         return {
           success: true,
-          // normalizeSensitivity also migrates legacy 1-10 values on read.
+          // normalizeSensitivity also folds unambiguously-legacy 1-10 values (>=6) on read.
           granularity: normalizeSensitivity(config.defaultGranularity)
         };
       }
