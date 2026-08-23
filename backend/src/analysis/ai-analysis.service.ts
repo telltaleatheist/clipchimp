@@ -14,7 +14,13 @@ import { AIProviderService, AIProviderConfig } from './ai-provider.service';
 import { OllamaService } from './ollama.service';
 import { estimateNumCtx, numCtxMaxForModel, parseProviderModel, AITaskKind } from './model-utils';
 import { ChapterDetectionService } from './chapter-detection.service';
-import { NliRankerService, assembleSentences, FlagCandidate } from './nli-ranker.service';
+import {
+  NliRankerService,
+  assembleSentences,
+  FlagWindow,
+  RankedSentence,
+  WindowCategory,
+} from './nli-ranker.service';
 import { findPhraseTimestamp } from './phrase-matcher';
 import { safeJsonParse } from './json-utils';
 import { ApiKeysService } from '../config/api-keys.service';
@@ -317,14 +323,6 @@ const FLAGS_DISCOVERY = process.env.BRIEFCASE_FLAGS_DISCOVERY === '1';
  * call instead of paying an Ollama model reload per call.
  */
 const VERIFY_OUTPUT_BUDGET_TOKENS = 2048;
-
-/**
- * How many sentences of context surround the candidate in the verification
- * prompt. +/-2 is what the measured runs used: enough for the sentence before to
- * establish who is speaking and whether the claim is being introduced or
- * knocked down, small enough that the prompt stays ~1,500 characters.
- */
-const VERIFY_CONTEXT_SENTENCES = 2;
 
 /**
  * JSON Schema for tag extraction — the SAME `{people, topics}` shape the parser
@@ -954,7 +952,7 @@ export class AIAnalysisService {
       const pass1Calls = detection.placeCalls;
       let chapterCallCount = boundaries.length;
       // Flag calls are NO LONGER one per chapter. On the default ranked path
-      // there is one call per (sentence, category) candidate, a number nothing
+      // there is one call per (window, category) pair, a number nothing
       // knows until the ranker has run — so this starts at the old
       // one-per-chapter estimate and the flag stage corrects it the moment it
       // knows, exactly as the chapter loop corrects chapterCallCount after long
@@ -1443,64 +1441,53 @@ export class AIAnalysisService {
   }
 
   /**
-   * Merge verified sentences into sections.
+   * Turn verified windows into stored sections — ONE section per window.
    *
-   * A speaker making one point usually spends two or three sentences on it, and
-   * the ranker scores each of them separately — so a single moment arrives here
-   * as a run of adjacent candidates in the same category. Merging that run into
-   * one section is what makes the timeline readable, and the merged span is
-   * MEASURED (first sentence's start, last sentence's end), not a fixed window.
+   * WHY ONE, when a window can have several verified categories. The operator's
+   * complaint about the previous shape was over-splitting: four back-to-back
+   * single-sentence flags for one moment. Emitting one section per verified
+   * category on the same passage is the same complaint in a different costume —
+   * three markers stacked on the same 20 seconds of timeline. So the section
+   * carries the STRONGEST verified category, and the others are named in the
+   * description after the quote as `[also: hate, extremism]`. Nothing is lost:
+   * `description` is the field both section lists and the timeline tooltip
+   * render, so the extra categories are on screen wherever the flag is.
    *
-   * Merging is deliberately PER CATEGORY. One sentence can legitimately be two
-   * flags — a line that both demonizes and dehumanizes is genuinely both — and
-   * collapsing across categories would silently delete one of them. This is the
-   * same reason the ranker keeps every category above threshold rather than the
-   * argmax.
+   * The SPAN is measured, never a fixed window: it runs from the first to the
+   * last sentence that fired a VERIFIED category, and the quote is that span
+   * read verbatim. Sentences that fired only a category the verifier rejected do
+   * not stretch the span, and the surrounding context the model was shown is not
+   * part of it — a viewer clicking the flag lands on the words that earned it.
    */
-  private mergeVerifiedCandidates(flagged: FlagCandidate[]): AnalyzedSection[] {
-    const byCategory = new Map<string, FlagCandidate[]>();
-    for (const candidate of flagged) {
-      const list = byCategory.get(candidate.category);
-      if (list) list.push(candidate);
-      else byCategory.set(candidate.category, [candidate]);
-    }
-
+  private buildWindowSections(
+    verified: Array<{ window: FlagWindow; categories: WindowCategory[] }>,
+    sentences: RankedSentence[],
+  ): AnalyzedSection[] {
     const sections: AnalyzedSection[] = [];
-    for (const [category, list] of byCategory) {
-      list.sort((a, b) => a.sentenceIndex - b.sentenceIndex);
-      let run: FlagCandidate[] = [];
 
-      const flush = () => {
-        if (run.length === 0) return;
-        const first = run[0];
-        const last = run[run.length - 1];
-        const text = run.map((c) => c.text).join(' ');
-        sections.push({
-          category,
-          // The verifier answers with a verdict and nothing else, so there is no
-          // generated explanation to show — and inventing one would be a
-          // fabrication. The flagged sentence IS the finding. `description` is
-          // the field the UI actually renders (analysis-panel section list and
-          // the timeline marker tooltip both bind section.description), so the
-          // quoted sentence goes there, in the same `"…"` form the discovery
-          // path produces for a quote with no reason attached.
-          description: `"${text}"`,
-          start_time: this.formatDisplayTime(first.start),
-          end_time: this.formatDisplayTime(last.end),
-          quotes: [{ timestamp: this.formatDisplayTime(first.start), text }],
-        });
-        run = [];
-      };
+    for (const { categories } of verified) {
+      if (categories.length === 0) continue;
+      // Strongest first: `categories` arrives ordered by the ranker's per-
+      // category best score, and the primary is simply the survivor at the top.
+      const ranked = [...categories].sort((a, b) => b.score - a.score);
+      const primary = ranked[0];
+      const also = ranked.slice(1).map((c) => c.category);
 
-      for (const candidate of list) {
-        const previous = run[run.length - 1];
-        const contiguous =
-          previous &&
-          (candidate.sentenceIndex <= previous.sentenceIndex + 1 || candidate.start <= previous.end);
-        if (!contiguous) flush();
-        run.push(candidate);
-      }
-      flush();
+      const fired = ranked.flatMap((c) => c.sentenceIndices);
+      const from = Math.min(...fired);
+      const to = Math.max(...fired);
+      const text = sentences.slice(from, to + 1).map((sentence) => sentence.text).join(' ');
+
+      sections.push({
+        category: primary.category,
+        // The verifier answers with a verdict and nothing else, so there is no
+        // generated explanation to show — and inventing one would be a
+        // fabrication. The flagged passage IS the finding.
+        description: `"${text}"${also.length > 0 ? ` [also: ${also.join(', ')}]` : ''}`,
+        start_time: this.formatDisplayTime(sentences[from].start),
+        end_time: this.formatDisplayTime(sentences[to].end),
+        quotes: [{ timestamp: this.formatDisplayTime(sentences[from].start), text }],
+      });
     }
 
     return sections.sort(
@@ -1509,13 +1496,14 @@ export class AIAnalysisService {
   }
 
   /**
-   * The DEFAULT flag path: rank every sentence, then verify each candidate.
+   * The DEFAULT flag path: rank every sentence, group the survivors into
+   * paragraph-sized windows, then ask one question per (window, category).
    *
    * Returns null when the ranker is unavailable or its scoring call fails, which
    * is the caller's signal to run the old chapter-discovery pass instead. It
-   * never throws for a per-candidate problem: a failed or unreadable
-   * verification is that candidate degrading to 'skip' with a warning, NOT a
-   * recordFailure — one bad HTTP call must not push a run toward
+   * never throws for a per-call problem: a failed or unreadable
+   * verification is that (window, category) degrading to 'skip' with a warning,
+   * NOT a recordFailure — one bad HTTP call must not push a run toward
    * TOO_MANY_FAILURES when the pipeline is making hundreds of tiny calls. A
    * TOTAL failure (Ollama down, so every call throws) is reported to the caller
    * the same way chapter analysis reports total failure: the run's own
@@ -1537,47 +1525,53 @@ export class AIAnalysisService {
       return [];
     }
 
-    let candidates: FlagCandidate[];
+    let windows: FlagWindow[];
     try {
       onFlagStatus?.(`Ranking ${sentences.length} sentences for flag candidates...`);
-      candidates = await this.nliRanker.rankSentences(sentences, categories, sensitivity);
+      windows = await this.nliRanker.rankWindows(sentences, categories, sensitivity);
     } catch (error) {
       this.logger.warn(`[Pass 2b] NLI ranking failed: ${(error as Error).message}`);
       return null;
     }
 
+    // One call per (window, category) — a passage where three categories fired
+    // costs three questions, not one per (sentence, category) pair.
+    const jobs: Array<{ window: FlagWindow; category: WindowCategory; prompt: string }> = [];
+    for (const window of windows) {
+      const passage = sentences.slice(window.contextFrom, window.contextTo + 1).map((s) => s.text);
+      for (const category of window.categories) {
+        jobs.push({
+          window,
+          category,
+          prompt: buildFlagVerificationPrompt(
+            passage,
+            category.category,
+            category.proposition,
+            sensitivity,
+          ),
+        });
+      }
+    }
+
     const threshold = this.nliRanker.thresholdForSensitivity(sensitivity);
     this.logger.log(
       `[Pass 2b] Ranked ${sentences.length} sentences at threshold ${threshold} ` +
-      `(sensitivity ${normalizeSensitivity(sensitivity)}) -> ${candidates.length} candidates to verify ` +
-      `on ${flagConfig.provider}:${flagConfig.model}`,
+      `(sensitivity ${normalizeSensitivity(sensitivity)}) -> ${windows.length} windows / ${jobs.length} ` +
+      `verification calls on ${flagConfig.provider}:${flagConfig.model}`,
     );
 
-    // The candidate count is only known NOW, so this is where the run's API-call
+    // The call count is only known NOW, so this is where the run's API-call
     // estimate gets corrected — the same mid-run recompute the chapter loop does
     // after long chapters are split.
-    onFlagProgress?.(0, candidates.length);
-    if (candidates.length === 0) return [];
+    onFlagProgress?.(0, jobs.length);
+    if (jobs.length === 0) return [];
 
     // ONE num_ctx for every verification call in the stage, sized from the
     // largest prompt. Ollama fully reloads the model on ANY num_ctx change, and
-    // these prompts differ only by a sentence or two of context — per-call
-    // sizing would buy reloads and nothing else.
-    const prompts = candidates.map((candidate) =>
-      buildFlagVerificationPrompt(
-        candidate.text,
-        sentences
-          .slice(Math.max(0, candidate.sentenceIndex - VERIFY_CONTEXT_SENTENCES), candidate.sentenceIndex)
-          .map((s) => s.text),
-        sentences
-          .slice(candidate.sentenceIndex + 1, candidate.sentenceIndex + 1 + VERIFY_CONTEXT_SENTENCES)
-          .map((s) => s.text),
-        candidate.category,
-        candidate.proposition,
-      ),
-    );
+    // these prompts differ only by the length of their passage — per-call sizing
+    // would buy reloads and nothing else.
     const numCtx = estimateNumCtx(
-      prompts.reduce((max, prompt) => Math.max(max, prompt.length), 0),
+      jobs.reduce((max, job) => Math.max(max, job.prompt.length), 0),
       flagConfig.model,
       VERIFY_OUTPUT_BUDGET_TOKENS,
     );
@@ -1590,33 +1584,39 @@ export class AIAnalysisService {
       ...(flagConfig.provider === 'ollama' ? { format: FLAG_VERIFICATION_SCHEMA } : {}),
     };
 
-    const flagged: FlagCandidate[] = [];
+    // Verified categories per window, keyed by the window object itself: jobs
+    // are walked in noisy-OR order, so a window's categories can be answered
+    // consecutively but a window is only finished when all of them are.
+    const verifiedByWindow = new Map<FlagWindow, WindowCategory[]>();
+    let flaggedCalls = 0;
     let skipped = 0;
     let degraded = 0;
     const startedAt = Date.now();
 
-    for (let i = 0; i < candidates.length; i++) {
-      const candidate = candidates[i];
+    for (let i = 0; i < jobs.length; i++) {
+      const { window, category, prompt } = jobs[i];
+      const where = `${this.formatDisplayTime(sentences[window.firedFrom].start)} (${category.category})`;
       try {
-        const response = await this.aiProviderService.generateText(prompts[i], flagConfig, 'flags', overrides);
+        const response = await this.aiProviderService.generateText(prompt, flagConfig, 'flags', overrides);
         onTokens?.(response);
 
         if (response.doneReason === 'length') {
           degraded++;
           this.logger.warn(
-            `[Pass 2b] Verification hit the token ceiling at ${this.formatDisplayTime(candidate.start)} ` +
-            `(${candidate.category}) — skipping this candidate`,
+            `[Pass 2b] Verification hit the token ceiling at ${where} — skipping this category`,
           );
         } else {
           const verdict = this.parseVerificationVerdict(response.text);
           if (verdict === null) {
             degraded++;
             this.logger.warn(
-              `[Pass 2b] No verdict in the verification answer at ${this.formatDisplayTime(candidate.start)} ` +
-              `(${candidate.category}) — skipping this candidate`,
+              `[Pass 2b] No verdict in the verification answer at ${where} — skipping this category`,
             );
           } else if (verdict === 'flag') {
-            flagged.push(candidate);
+            flaggedCalls++;
+            const list = verifiedByWindow.get(window);
+            if (list) list.push(category);
+            else verifiedByWindow.set(window, [category]);
           } else {
             skipped++;
           }
@@ -1624,32 +1624,39 @@ export class AIAnalysisService {
       } catch (error) {
         degraded++;
         this.logger.warn(
-          `[Pass 2b] Verification call failed at ${this.formatDisplayTime(candidate.start)} ` +
-          `(${candidate.category}): ${(error as Error).message} — skipping this candidate`,
+          `[Pass 2b] Verification call failed at ${where}: ${(error as Error).message} — skipping this category`,
         );
       }
-      onFlagProgress?.(i + 1, candidates.length);
+      onFlagProgress?.(i + 1, jobs.length);
     }
 
     const wallSeconds = (Date.now() - startedAt) / 1000;
     this.logger.log(
-      `[Pass 2b] Verified ${candidates.length} candidates in ${wallSeconds.toFixed(1)}s ` +
-      `(${(wallSeconds / candidates.length).toFixed(2)}s/call): ` +
-      `${flagged.length} flag, ${skipped} skip, ${degraded} unusable`,
+      `[Pass 2b] Verified ${jobs.length} (window, category) pairs across ${windows.length} windows in ` +
+      `${wallSeconds.toFixed(1)}s (${(wallSeconds / jobs.length).toFixed(2)}s/call): ` +
+      `${flaggedCalls} flag, ${skipped} skip, ${degraded} unusable`,
     );
 
     // Every single call failing is a broken stage, not a quiet result. Report it
     // ONCE — the same shape as a chapter's total failure — so the job's failure
     // accounting sees it without being flooded by hundreds of per-call entries.
-    if (degraded === candidates.length) {
+    if (degraded === jobs.length) {
       recordFailure(
-        `Pass 2b flag verification produced no usable verdicts across all ${candidates.length} candidates`,
+        `Pass 2b flag verification produced no usable verdicts across all ${jobs.length} calls`,
       );
     }
 
-    const sections = this.mergeVerifiedCandidates(flagged);
+    // Windows in transcript order, so the sections are built in the order the
+    // video plays rather than in noisy-OR order.
+    const verified = windows
+      .filter((window) => verifiedByWindow.has(window))
+      .sort((a, b) => a.contextFrom - b.contextFrom)
+      .map((window) => ({ window, categories: verifiedByWindow.get(window) as WindowCategory[] }));
+
+    const sections = this.buildWindowSections(verified, sentences);
     this.logger.log(
-      `[Pass 2b] Merged ${flagged.length} verified sentences into ${sections.length} flag sections`,
+      `[Pass 2b] ${flaggedCalls} verified (window, category) verdicts across ${verified.length} windows ` +
+      `-> ${sections.length} flag sections`,
     );
     return sections;
   }
@@ -1843,15 +1850,14 @@ export class AIAnalysisService {
         );
         if (ranked) {
           this.logger.log(
-            `[Pass 2b] FLAG PATH: ranked + verified (NLI sentence ranking, one verification call per ` +
-            `candidate) — ${ranked.length} flag sections`,
+            `[Pass 2b] FLAG PATH: ranked + verified (NLI sentence ranking, merged into passages, one ` +
+            `verification call per (window, category)) — ${ranked.length} flag sections`,
           );
           // Returned WITHOUT the 5-second timestamp dedup below. That dedup
           // exists to clean up after a discovery model emitting several flags
-          // for one moment, and it is category-BLIND: it would delete the second
-          // category of a sentence that legitimately matches two. This path
-          // merges per category by construction, so there is nothing left to
-          // dedup and something real to lose.
+          // for one moment; this path already emits exactly one section per
+          // window, so there is nothing left for it to find and a real risk it
+          // would delete a legitimately distinct neighbouring passage.
           return { chapters, flags: ranked };
         }
         unavailableReason = 'NLI ranking failed mid-run';

@@ -11,15 +11,21 @@
  *
  * This path splits the job into the two halves each engine is actually good at:
  *
- *   1. RANK (this file, cheap, exhaustive)  Every sentence is scored against
- *      every enabled category's stance hypothesis by a zero-shot NLI model
- *      running in a resident Python subprocess. ~1,900 sentences of a 60-minute
- *      video score in ~40s on MPS. Nothing is skipped, so nothing is "missed
- *      because the model stopped early".
+ *   1. RANK (this file, cheap, exhaustive)  Every sentence, and every sliding
+ *      3-sentence window, is scored against every enabled category's stance
+ *      hypotheses by a zero-shot NLI model running in a resident Python
+ *      subprocess. A 60-minute video scores in ~90s on MPS. Nothing is skipped,
+ *      so nothing is "missed because the model stopped early".
  *
- *   2. VERIFY (ai-analysis.service)  One tiny schema-constrained LLM call per
- *      surviving (sentence, category) candidate, answering exactly one question:
- *      is the speaker asserting this, or reporting/questioning/debunking it?
+ *   2. WINDOW (this file, buildWindows)  Surviving sentences are expanded to the
+ *      sentences around them and merged, category-blind, into paragraph-sized
+ *      passages. Scoring stays per sentence; JUDGING moves up to the passage,
+ *      because a viewer experiences one moment, not four consecutive sentences.
+ *
+ *   3. VERIFY (ai-analysis.service)  One tiny schema-constrained LLM call per
+ *      (window, category), answering exactly one question about the whole
+ *      passage: is the speaker asserting this, or reporting/questioning/
+ *      debunking it?
  *
  * Timestamps are the SENTENCE's timestamps — taken from the transcript segments
  * the sentence was assembled from. There is no phrase matching in this path and
@@ -58,9 +64,19 @@ export interface RankedSentence {
   text: string;
 }
 
-/** One (sentence, category) pair that scored above threshold. */
+/**
+ * One (span, category) pair the ranker kept.
+ *
+ * A SENTENCE-level candidate spans one sentence (`spanFrom === spanTo ===
+ * sentenceIndex`). A WINDOW-level candidate spans the sliding window that
+ * scored — see scoreWindowLevel — and `sentenceIndex` is its best guess at a
+ * representative sentence, used only for logging.
+ */
 export interface FlagCandidate {
   sentenceIndex: number;
+  /** Inclusive sentence-index range this candidate covers. */
+  spanFrom: number;
+  spanTo: number;
   start: number;
   end: number;
   text: string;
@@ -68,6 +84,65 @@ export interface FlagCandidate {
   score: number;
   /** The stance proposition the verifier will test this candidate against. */
   proposition: string;
+  /** Which pass produced it — sentence-level scoring or sliding-window scoring. */
+  source: 'sentence' | 'window';
+  /**
+   * True when this pair never cleared the threshold on its own and exists only
+   * because the sentence fired several categories just under it — see the
+   * RESCUE rule below.
+   */
+  rescued: boolean;
+}
+
+/** One category's evidence inside a verification window. */
+export interface WindowCategory {
+  category: string;
+  proposition: string;
+  /** The window's BEST score for this category... */
+  score: number;
+  /** ...and the sentence that scored it. */
+  sentenceIndex: number;
+  text: string;
+  start: number;
+  end: number;
+  /** Every sentence in the window that fired this category, in transcript order. */
+  sentenceIndices: number[];
+  /** True only when EVERY firing of this category in the window was a rescue. */
+  rescued: boolean;
+}
+
+/**
+ * A paragraph-sized passage of transcript that the verifier judges as a whole.
+ *
+ * Scoring stays at SENTENCE granularity (that is what fixed stretch-level
+ * dilution and it is not changed here). A window is what happens AFTER
+ * thresholding: each hot sentence is expanded to the sentences around it, and
+ * overlapping or near-adjacent expansions are merged into one passage
+ * regardless of category. The window then carries the UNION of its sentences'
+ * fired categories, and one verification call is made per (window, category) —
+ * so a passage where three categories fired costs three calls, not one per
+ * (sentence, category) pair.
+ */
+export interface FlagWindow {
+  /** Inclusive sentence-index range of the passage the verifier is shown. */
+  contextFrom: number;
+  contextTo: number;
+  /** Inclusive sentence-index range of the sentences that actually fired. */
+  firedFrom: number;
+  firedTo: number;
+  /** Union of the fired categories, strongest first. */
+  categories: WindowCategory[];
+  /** Noisy-OR over the per-category best scores — the ranking score. */
+  score: number;
+}
+
+/** One category's scoring plan for a run: what to rank with, what to verify with. */
+export interface RankPlan {
+  category: string;
+  /** One or more stance hypotheses; a category scores as the MAX across them. */
+  hypotheses: string[];
+  proposition: string;
+  tuned: boolean;
 }
 
 interface WorkerResponse {
@@ -92,16 +167,66 @@ interface WorkerResponse {
  *
  * `misinformation` IS ABSENT ON PURPOSE — see MISINFORMATION_EXCLUSION below.
  */
-const HYPOTHESES: Record<string, string> = {
+const HYPOTHESES: Record<string, string | string[]> = {
   'political-demonization':
     'The speaker asserts that political opponents are communists, Marxists, or enemies of the country.',
   hate: 'The speaker expresses hostility or mockery toward a group based on race, religion, or identity.',
   conspiracy: 'The speaker promotes a conspiracy theory as true.',
-  dehumanization:
+  // MEASURED, dh-probe.js on both reference videos. The single hypothesis below
+  // scored a MAXIMUM of 0.172 over the 12-minute political video and 0.016 over
+  // the 60-minute one — including 0.150 on "With a whole army of commies,
+  // zombies behind him", a sentence containing the literal word 'zombies'. It is
+  // phrased as a DESCRIPTION OF THE ACT ("describes people as subhuman"), which
+  // is what an analyst would write in a report; it is not how the thing is ever
+  // said out loud. So, as with christian-nationalism, the category carries
+  // several propositions and takes the max.
+  //
+  // WHAT WAS TRIED AND REJECTED, because a loose proposition here costs
+  // precision on ordinary political insult:
+  //
+  //   'compares a group of people to zombies, animals, or insects'  — scored
+  //     0.958 on "That's 323 death rattlers there here in San Diego" (a Marine
+  //     squadron nickname) and 0.908 on "we need those wildcatters out there"
+  //     (oil drilling). It matched animal NOUNS, not the dehumanizing move.
+  //   'refers to a group as a horde, a swarm, or a mindless mass'  — scored
+  //     0.999 on "They have pack of fools" and 0.780 on the neutral sentence
+  //     "The communists have proven they can win in coastal cities".
+  //   'attributes opponents' politics to psychological damage, guilt,
+  //     resentment, or family problems'  — scored 0.973 on "Do you blame the
+  //     parents?" in a passage about the fentanyl crisis. Naming POLITICAL
+  //     BELIEF explicitly (the surviving form below) drops that to 0.062.
+  //
+  // All five kept propositions together score, on the video with no dehumanizing
+  // content at all, ZERO sentences above 0.5 and ZERO windows above 0.7.
+  dehumanization: [
     'The speaker describes people as subhuman, as vermin, disease, or zombies, or as mentally ill because of their politics.',
+    'The speaker describes a group of people as an infestation, a plague, a fever, or something spreading through the country.',
+    'The speaker calls a crowd of political supporters zombies or mindless followers.',
+    "The speaker explains opponents' politics as mental illness, derangement, or personal damage rather than sincere belief.",
+    'The speaker says opponents hold their political beliefs because of psychological damage, guilt, or resentment rather than reason.',
+  ],
   violence: 'The speaker calls for, threatens, or glorifies violence.',
   'false-prophecy': 'The speaker claims to receive communication or prophecy from God.',
-  'christian-nationalism': 'The speaker argues that Christianity should control politics or government.',
+  // MEASURED, cn-probe.js on the 60-minute reference video: the single
+  // hypothesis "Christianity should control politics or government" scored a
+  // MAXIMUM of 0.457 over 801 sentences — zero candidates at any sensitivity —
+  // on a video whose subject is prayer ministries operating inside the White
+  // House and God-ordained regime change. It reads as a claim about doctrine,
+  // and nobody says it that way out loud; what they say is "there are Christians
+  // in the White House" and "God is determined to see this happen".
+  //
+  // A category may therefore carry SEVERAL hypotheses and takes the MAX across
+  // them, because entailment is a per-proposition question and one category can
+  // be argued in genuinely different propositions. These two were picked against
+  // the reference videos: on the 60-minute video they lift the category from 0
+  // to real candidates (0.961 sentence / 0.989 window), and on the 12-minute
+  // political video, which has no Christian-nationalist content at all, they
+  // score 0.025 and 0.089 max — so they do not leak into unrelated material.
+  'christian-nationalism': [
+    'The speaker argues that Christianity should control politics or government.',
+    'The speaker says Christians or the church should take authority in government or public life.',
+    'The speaker says God is directing the nation, its government, or its leaders.',
+  ],
   'prosperity-gospel': 'The speaker asks followers for money as a religious duty.',
   extremism: 'The speaker defends oppression, supremacy, or authoritarian rule.',
   'political-violence': 'The speaker defends or downplays political violence.',
@@ -173,15 +298,109 @@ const MISINFORMATION_EXCLUSION =
  *                                   non-marginal hand-audit ground truth on both
  *                                   reference videos.
  *   3 (aggressive)           0.5  — reads deeper into the list, more verifier
- *                                   calls, recall over precision.
+ *                                   calls, recall over precision. The verifier
+ *                                   is also asked to lean toward "flag" at this
+ *                                   setting (VERIFICATION_EMPHASIS in
+ *                                   analysis-prompts.ts) — a longer candidate
+ *                                   list answered by the same hard grader is
+ *                                   only half a dial.
  *
  * Cost scales with this dial, because every candidate is one verifier call.
  */
 const THRESHOLD_BY_SENSITIVITY: Record<1 | 2 | 3, number> = { 1: 0.9, 2: 0.7, 3: 0.5 };
 
+/**
+ * VERIFICATION WINDOWS — the parameters that turn hot sentences into passages.
+ *
+ * THE PROBLEM THEY SOLVE, from a real run: a speaker spends four sentences on
+ * one bit, the ranker scores each sentence separately and each one clears the
+ * threshold, and the timeline came back with four back-to-back single-sentence
+ * flags for what a viewer experiences as ONE moment. Per-category merging after
+ * verification could not fix that, because the four sentences were not all the
+ * same category.
+ *
+ * So the unit of VERIFICATION (and therefore of the stored section) is the
+ * passage, while the unit of SCORING stays the sentence.
+ *
+ *   WINDOW_CONTEXT_SENTENCES     +/-2 around the hot sentence, so an unmerged
+ *                                window is up to 5 sentences — the same +/-2 the
+ *                                measured verification runs already showed the
+ *                                model as context, now the thing being judged.
+ *   WINDOW_MAX_CONTEXT_SECONDS   A hard stop on that expansion. Sentences run
+ *                                3-6s in these transcripts, so 5 of them is
+ *                                normally 15-25s; the cap is what keeps a
+ *                                window that lands next to a 40-second monologue
+ *                                sentence from becoming a page.
+ *   WINDOW_MERGE_GAP_*           Two windows join when at most one sentence or
+ *                                5 seconds separates them. Merging is
+ *                                deliberately CATEGORY-BLIND: the four-flag run
+ *                                above was three different categories, and
+ *                                merging per category would have left it split.
+ *   WINDOW_MAX_MERGED_SECONDS    Chaining has to stop somewhere. Without a cap,
+ *                                a dense five-minute rant merges into a single
+ *                                section that is useless to scrub to and a
+ *                                prompt that no longer fits the pinned num_ctx.
+ *                                MEASURED: at 60s the verifier answered "skip"
+ *                                for the SECOND category of two long merged
+ *                                passages on the reference video and cost two
+ *                                hand-audited category labels (the moments were
+ *                                still flagged, under the other category); at
+ *                                40s both came back and the four-back-to-back
+ *                                run the operator reported still coalesces.
+ *                                40s is roughly 100-130 spoken words: a
+ *                                paragraph, which is what a passage judgment
+ *                                can carry without diluting the weaker claim.
+ */
+const WINDOW_CONTEXT_SENTENCES = 2;
+const WINDOW_MAX_CONTEXT_SECONDS = 25;
+const WINDOW_MERGE_GAP_SENTENCES = 1;
+const WINDOW_MERGE_GAP_SECONDS = 5;
+const WINDOW_MAX_MERGED_SECONDS = 40;
+
+/**
+ * RESCUE — corroboration standing in for certainty.
+ *
+ * A single category at 0.68 is below threshold and stays below threshold. But a
+ * sentence that scores 0.68 on dehumanization AND 0.66 on hate is not the same
+ * evidence as a sentence that scores 0.68 on one thing and nothing on anything
+ * else: two independent hypotheses both nearly entailing the same sentence is
+ * itself a signal. Such a sentence becomes a candidate, and its rescue is
+ * logged distinctly so a run's log shows exactly what the rule bought.
+ *
+ * The rule applies ONLY to sentences where nothing cleared the threshold.
+ * Adding near-threshold categories to already-hot sentences would add
+ * verification calls — the opposite of what this change is for — and would let
+ * a weak category attach itself to a strong sentence.
+ */
+const RESCUE_MARGIN = 0.15;
+const RESCUE_MIN_CATEGORIES = 2;
+
+/**
+ * SLIDING-WINDOW SCORING — the second ranking pass.
+ *
+ * Sentence-level scoring finds a sentence that entails a hypothesis on its own.
+ * It cannot find DISTRIBUTED rhetoric: a passage where the premise is in one
+ * sentence, the actor in the next and the conclusion in the third, and no single
+ * sentence carries the whole proposition. Measured symptom — a 60-minute video
+ * about prayer ministries operating inside the White House and God-ordained
+ * regime change produced ZERO christian-nationalism flags, because the argument
+ * is never in one sentence.
+ *
+ * So the same hypotheses are also scored against every SLIDING_WINDOW_SENTENCES
+ * -sentence window, stride 1, and those hits are unioned with the sentence-level
+ * ones. The NLI pass is local and cheap (both passes over a 60-minute video
+ * measured ~90s on MPS), so roughly doubling its work is affordable in a way
+ * that doubling verifier calls would not be — which is why the union is DEDUPED
+ * by span overlap before it ever reaches the verifier.
+ *
+ * Stride 1 with size 3 means overlapping windows fire on the same rhetoric; the
+ * dedupe keeps the highest-scoring window per category per overlapping run.
+ */
+const SLIDING_WINDOW_SENTENCES = 3;
+
 /** How long to wait for the worker's ready line (model load) before giving up. */
 const READY_TIMEOUT_MS = 180000;
-/** How long to wait for one scoring response. A 60-minute video measured ~40s. */
+/** How long to wait for one scoring response. One pass over 60 minutes: ~45s. */
 const SCORE_TIMEOUT_MS = 600000;
 
 // =============================================================================
@@ -243,6 +462,174 @@ export function assembleSentences(
     cursor = bound;
   }
   return out;
+}
+
+// =============================================================================
+// MULTI-HYPOTHESIS SCORING
+// =============================================================================
+
+/**
+ * Flatten a plan into the hypothesis list the worker scores, remembering which
+ * plan entry owns each column. A category with three hypotheses occupies three
+ * columns and collapses back to one score by MAX — the strongest way the
+ * category was argued wins, which is the right reduction for propositions that
+ * are alternatives rather than parts of one claim.
+ */
+function flattenHypotheses(plan: RankPlan[]): { texts: string[]; owner: number[] } {
+  const texts: string[] = [];
+  const owner: number[] = [];
+  for (let p = 0; p < plan.length; p++) {
+    for (const hypothesis of plan[p].hypotheses) {
+      texts.push(hypothesis);
+      owner.push(p);
+    }
+  }
+  return { texts, owner };
+}
+
+/** Collapse one row of raw hypothesis scores to one score per plan entry. */
+function collapseRow(row: number[], owner: number[], planCount: number): number[] {
+  const out = new Array<number>(planCount).fill(0);
+  for (let column = 0; column < owner.length; column++) {
+    const score = row?.[column] ?? 0;
+    if (score > out[owner[column]]) out[owner[column]] = score;
+  }
+  return out;
+}
+
+// =============================================================================
+// VERIFICATION WINDOWS
+// =============================================================================
+
+/** The per-category evidence one hot span contributes to a window. */
+function categoriesFromSpan(candidates: FlagCandidate[]): WindowCategory[] {
+  return candidates.map((candidate) => ({
+    category: candidate.category,
+    proposition: candidate.proposition,
+    score: candidate.score,
+    sentenceIndex: candidate.sentenceIndex,
+    text: candidate.text,
+    start: candidate.start,
+    end: candidate.end,
+    sentenceIndices: Array.from(
+      { length: candidate.spanTo - candidate.spanFrom + 1 },
+      (_unused, offset) => candidate.spanFrom + offset,
+    ),
+    rescued: candidate.rescued,
+  }));
+}
+
+/**
+ * Union two windows' category evidence. A category present in both keeps its
+ * BEST-scoring sentence (that is the quote the verdict is really about) and the
+ * union of every sentence that fired it (that is what the section's span is
+ * measured from).
+ */
+function mergeWindowCategories(a: WindowCategory[], b: WindowCategory[]): WindowCategory[] {
+  const out = new Map<string, WindowCategory>();
+  for (const entry of [...a, ...b]) {
+    const existing = out.get(entry.category);
+    if (!existing) {
+      out.set(entry.category, { ...entry, sentenceIndices: [...entry.sentenceIndices] });
+      continue;
+    }
+    const best = entry.score > existing.score ? entry : existing;
+    const indices = new Set([...existing.sentenceIndices, ...entry.sentenceIndices]);
+    out.set(entry.category, {
+      ...best,
+      sentenceIndices: [...indices].sort((x, y) => x - y),
+      // One threshold-clearing firing anywhere in the window means the category
+      // is not resting on the rescue rule.
+      rescued: existing.rescued && entry.rescued,
+    });
+  }
+  return [...out.values()];
+}
+
+/**
+ * Turn ranked (span, category) candidates into merged verification windows.
+ *
+ * Pure and exported so the shape can be exercised without a Python worker.
+ * Candidates must be in transcript order (ascending spanFrom, then spanTo),
+ * which is what `rankWindows` hands it.
+ *
+ * MULTI-CATEGORY BOOST. A window's ranking score is the noisy-OR of its
+ * categories' best scores, 1 - PROD(1 - s_i). Two independent hypotheses at
+ * 0.95 and 0.93 give 0.9965, which outranks any single 0.99 — which is the
+ * point: a passage that is demonizing AND hateful is worse content than a
+ * passage that is very confidently one thing, and the operator should see it
+ * first. The score orders VERIFICATION, it does not gate it; every window and
+ * every one of its categories is still verified.
+ */
+export function buildWindows(sentences: RankedSentence[], candidates: FlagCandidate[]): FlagWindow[] {
+  if (candidates.length === 0 || sentences.length === 0) return [];
+
+  const bySpan = new Map<string, FlagCandidate[]>();
+  for (const candidate of candidates) {
+    const key = `${candidate.spanFrom}:${candidate.spanTo}`;
+    const list = bySpan.get(key);
+    if (list) list.push(candidate);
+    else bySpan.set(key, [candidate]);
+  }
+  const hot = [...bySpan.values()].sort(
+    (a, b) => a[0].spanFrom - b[0].spanFrom || a[0].spanTo - b[0].spanTo,
+  );
+
+  // 1. Expand every hot span into a passage, alternating sides so a window at a
+  //    hard time cap is still balanced around the span that fired.
+  const expanded: FlagWindow[] = hot.map((group) => {
+    let from = group[0].spanFrom;
+    let to = group[0].spanTo;
+    for (let step = 0; step < WINDOW_CONTEXT_SENTENCES; step++) {
+      if (from > 0 && sentences[to].end - sentences[from - 1].start <= WINDOW_MAX_CONTEXT_SECONDS) from--;
+      if (
+        to + 1 < sentences.length &&
+        sentences[to + 1].end - sentences[from].start <= WINDOW_MAX_CONTEXT_SECONDS
+      ) {
+        to++;
+      }
+    }
+    return {
+      contextFrom: from,
+      contextTo: to,
+      firedFrom: group[0].spanFrom,
+      firedTo: group[0].spanTo,
+      categories: categoriesFromSpan(group),
+      score: 0,
+    };
+  });
+
+  // 2. Merge overlapping / near-adjacent passages, category-blind.
+  const merged: FlagWindow[] = [];
+  for (const window of expanded) {
+    const previous = merged[merged.length - 1];
+    if (previous) {
+      // Overlapping and nested windows give a negative gap, which both tests
+      // accept — that is the intent, they are the same passage.
+      const sentenceGap = window.contextFrom - previous.contextTo - 1;
+      const secondsGap = sentences[window.contextFrom].start - sentences[previous.contextTo].end;
+      const joinedFrom = Math.min(previous.contextFrom, window.contextFrom);
+      const joinedTo = Math.max(previous.contextTo, window.contextTo);
+      const joinedSpan = sentences[joinedTo].end - sentences[joinedFrom].start;
+      const close = sentenceGap <= WINDOW_MERGE_GAP_SENTENCES || secondsGap <= WINDOW_MERGE_GAP_SECONDS;
+      if (close && joinedSpan <= WINDOW_MAX_MERGED_SECONDS) {
+        previous.contextFrom = joinedFrom;
+        previous.contextTo = joinedTo;
+        previous.firedFrom = Math.min(previous.firedFrom, window.firedFrom);
+        previous.firedTo = Math.max(previous.firedTo, window.firedTo);
+        previous.categories = mergeWindowCategories(previous.categories, window.categories);
+        continue;
+      }
+    }
+    merged.push({ ...window, categories: [...window.categories] });
+  }
+
+  // 3. Score and order the evidence inside each window.
+  for (const window of merged) {
+    window.categories.sort((x, y) => y.score - x.score);
+    window.score = 1 - window.categories.reduce((product, c) => product * (1 - c.score), 1);
+  }
+  return merged;
 }
 
 // =============================================================================
@@ -312,7 +699,7 @@ export class NliRankerService implements OnApplicationShutdown {
   }
 
   /**
-   * The (category -> hypothesis, proposition) plan for this run.
+   * The (category -> hypotheses, proposition) plan for this run.
    *
    * Disabled categories are dropped. `misinformation` is dropped even when
    * enabled (see MISINFORMATION_EXCLUSION). A category with no tuned hypothesis
@@ -320,13 +707,8 @@ export class NliRankerService implements OnApplicationShutdown {
    * wrapped as a proposition, and says so in the log, because an untuned
    * hypothesis has no calibrated threshold behind it.
    */
-  buildPlan(categories: AnalysisCategory[]): Array<{
-    category: string;
-    hypothesis: string;
-    proposition: string;
-    tuned: boolean;
-  }> {
-    const plan: Array<{ category: string; hypothesis: string; proposition: string; tuned: boolean }> = [];
+  buildPlan(categories: AnalysisCategory[]): RankPlan[] {
+    const plan: RankPlan[] = [];
 
     for (const category of categories || []) {
       const name = (category?.name || '').trim();
@@ -339,7 +721,12 @@ export class NliRankerService implements OnApplicationShutdown {
 
       const tuned = HYPOTHESES[name];
       if (tuned) {
-        plan.push({ category: name, hypothesis: tuned, proposition: PROPOSITIONS[name], tuned: true });
+        plan.push({
+          category: name,
+          hypotheses: Array.isArray(tuned) ? tuned : [tuned],
+          proposition: PROPOSITIONS[name],
+          tuned: true,
+        });
         continue;
       }
 
@@ -354,7 +741,7 @@ export class NliRankerService implements OnApplicationShutdown {
       );
       plan.push({
         category: name,
-        hypothesis: `The speaker's statement matches this description: ${description}`,
+        hypotheses: [`The speaker's statement matches this description: ${description}`],
         proposition: description,
         tuned: false,
       });
@@ -561,39 +948,214 @@ export class NliRankerService implements OnApplicationShutdown {
   ): Promise<FlagCandidate[]> {
     const plan = this.buildPlan(categories);
     if (plan.length === 0 || sentences.length === 0) return [];
+    return this.scoreSentenceLevel(sentences, plan, this.thresholdForSensitivity(sensitivity));
+  }
 
-    const threshold = this.thresholdForSensitivity(sensitivity);
-    const scores = await this.score(
+  private async scoreSentenceLevel(
+    sentences: RankedSentence[],
+    plan: RankPlan[],
+    threshold: number,
+  ): Promise<FlagCandidate[]> {
+    const { texts: hypotheses, owner } = flattenHypotheses(plan);
+    const raw = await this.score(
       sentences.map((s) => s.text),
-      plan.map((p) => p.hypothesis),
+      hypotheses,
     );
+    const scores = raw.map((row) => collapseRow(row, owner, plan.length));
 
     const candidates: FlagCandidate[] = [];
+    let rescuedSentences = 0;
+    const make = (i: number, c: number, score: number, rescued: boolean): FlagCandidate => ({
+      sentenceIndex: i,
+      spanFrom: i,
+      spanTo: i,
+      start: sentences[i].start,
+      end: sentences[i].end,
+      text: sentences[i].text,
+      category: plan[c].category,
+      score,
+      proposition: plan[c].proposition,
+      source: 'sentence',
+      rescued,
+    });
+
     for (let i = 0; i < sentences.length && i < scores.length; i++) {
       const row = scores[i];
       const hits: FlagCandidate[] = [];
       for (let c = 0; c < plan.length; c++) {
         const score = row[c] ?? 0;
-        if (score < threshold) continue;
-        hits.push({
-          sentenceIndex: i,
-          start: sentences[i].start,
-          end: sentences[i].end,
-          text: sentences[i].text,
-          category: plan[c].category,
-          score,
-          proposition: plan[c].proposition,
-        });
+        if (score >= threshold) hits.push(make(i, c, score, false));
       }
+
+      // RESCUE (see RESCUE_MARGIN): nothing cleared the bar alone, but several
+      // categories came close together. Only ever applied to a sentence with no
+      // threshold-clearing category.
+      if (hits.length === 0) {
+        const near: FlagCandidate[] = [];
+        for (let c = 0; c < plan.length; c++) {
+          const score = row[c] ?? 0;
+          if (score >= threshold - RESCUE_MARGIN) near.push(make(i, c, score, true));
+        }
+        if (near.length >= RESCUE_MIN_CATEGORIES) {
+          near.sort((a, b) => b.score - a.score);
+          hits.push(...near);
+          rescuedSentences++;
+          this.logger.log(
+            `[NLI] RESCUED ${sentences[i].start.toFixed(1)}s on ${near.length} corroborating categories ` +
+            `(${near.map((n) => `${n.category} ${n.score.toFixed(3)}`).join(', ')}) — ` +
+            `none reached ${threshold}, all within ${RESCUE_MARGIN}: "${sentences[i].text.slice(0, 90)}"`,
+          );
+        }
+      }
+
       hits.sort((a, b) => b.score - a.score);
       candidates.push(...hits);
     }
 
     this.logger.log(
-      `[NLI] Ranked ${sentences.length} sentences x ${plan.length} categories ` +
-      `at threshold ${threshold} -> ${candidates.length} candidates`,
+      `[NLI] Sentence pass: ${sentences.length} sentences x ${plan.length} categories ` +
+      `at threshold ${threshold} -> ${candidates.length} candidates ` +
+      `(${rescuedSentences} sentence(s) rescued on 2+ near-threshold categories)`,
     );
     return candidates;
+  }
+
+  /**
+   * Score every sliding SLIDING_WINDOW_SENTENCES-sentence window and return the
+   * hits that add something the sentence pass did not already have.
+   *
+   * DEDUPE, in this order, both by span overlap:
+   *   1. against the sentence pass — if that category already fired on a
+   *      sentence inside this window, the window is the same finding restated
+   *      and only costs a verifier call;
+   *   2. against stronger windows of the same category — stride-1 windows
+   *      overlap by construction, so a run of them is one finding and the
+   *      highest-scoring window is the one that represents it.
+   */
+  private async scoreWindowLevel(
+    sentences: RankedSentence[],
+    plan: RankPlan[],
+    threshold: number,
+    sentenceLevel: FlagCandidate[],
+  ): Promise<FlagCandidate[]> {
+    const size = SLIDING_WINDOW_SENTENCES;
+    if (sentences.length < size) return [];
+
+    const texts: string[] = [];
+    for (let i = 0; i + size <= sentences.length; i++) {
+      texts.push(
+        sentences
+          .slice(i, i + size)
+          .map((s) => s.text)
+          .join(' '),
+      );
+    }
+
+    const { texts: hypotheses, owner } = flattenHypotheses(plan);
+    const scores = (await this.score(texts, hypotheses)).map((row) =>
+      collapseRow(row, owner, plan.length),
+    );
+
+    const raw: FlagCandidate[] = [];
+    for (let w = 0; w < texts.length && w < scores.length; w++) {
+      const row = scores[w];
+      for (let c = 0; c < plan.length; c++) {
+        const score = row[c] ?? 0;
+        if (score < threshold) continue;
+        raw.push({
+          // Representative sentence = the middle of the window; used for logs,
+          // never for the span (which is the whole window).
+          sentenceIndex: w + Math.floor(size / 2),
+          spanFrom: w,
+          spanTo: w + size - 1,
+          start: sentences[w].start,
+          end: sentences[w + size - 1].end,
+          text: texts[w],
+          category: plan[c].category,
+          score,
+          proposition: plan[c].proposition,
+          source: 'window',
+          rescued: false,
+        });
+      }
+    }
+
+    const alreadyHot = new Map<string, number[]>();
+    for (const candidate of sentenceLevel) {
+      const list = alreadyHot.get(candidate.category);
+      if (list) list.push(candidate.sentenceIndex);
+      else alreadyHot.set(candidate.category, [candidate.sentenceIndex]);
+    }
+
+    const keptSpans = new Map<string, Array<[number, number]>>();
+    const kept: FlagCandidate[] = [];
+    for (const candidate of [...raw].sort((a, b) => b.score - a.score)) {
+      const hotHere = alreadyHot.get(candidate.category) || [];
+      if (hotHere.some((i) => i >= candidate.spanFrom && i <= candidate.spanTo)) continue;
+
+      const spans = keptSpans.get(candidate.category) || [];
+      if (spans.some(([from, to]) => from <= candidate.spanTo && to >= candidate.spanFrom)) continue;
+      spans.push([candidate.spanFrom, candidate.spanTo]);
+      keptSpans.set(candidate.category, spans);
+      kept.push(candidate);
+    }
+
+    kept.sort((a, b) => a.spanFrom - b.spanFrom);
+    this.logger.log(
+      `[NLI] Window pass: ${texts.length} sliding ${size}-sentence windows x ${plan.length} categories ` +
+      `at threshold ${threshold} -> ${raw.length} raw hits, ${kept.length} new candidates ` +
+      `(${raw.length - kept.length} deduped against the sentence pass or a stronger overlapping window)`,
+    );
+    for (const candidate of kept) {
+      this.logger.log(
+        `[NLI] DISTRIBUTED ${candidate.start.toFixed(1)}s ${candidate.category} ${candidate.score.toFixed(3)} ` +
+        `— no single sentence fired: "${candidate.text.slice(0, 120)}"`,
+      );
+    }
+    return kept;
+  }
+
+  /**
+   * The stage-1 entry point the flag stage actually calls: rank sentences AND
+   * sliding windows, union the two, then group the survivors into merged
+   * verification windows, strongest first.
+   *
+   * Ordering is by the window's noisy-OR score so a run that is interrupted, or
+   * watched live, surfaces the worst passages first. It does NOT gate anything:
+   * the caller verifies every window and every category in it.
+   */
+  async rankWindows(
+    sentences: RankedSentence[],
+    categories: AnalysisCategory[],
+    sensitivity?: number,
+  ): Promise<FlagWindow[]> {
+    const plan = this.buildPlan(categories);
+    if (plan.length === 0 || sentences.length === 0) return [];
+    const threshold = this.thresholdForSensitivity(sensitivity);
+
+    const sentenceLevel = await this.scoreSentenceLevel(sentences, plan, threshold);
+    const windowLevel = await this.scoreWindowLevel(sentences, plan, threshold, sentenceLevel);
+    const candidates = [...sentenceLevel, ...windowLevel].sort(
+      (a, b) => a.spanFrom - b.spanFrom || a.spanTo - b.spanTo,
+    );
+
+    const windows = buildWindows(sentences, candidates);
+    // Sort on the LOG of the noisy-OR complement, not the noisy-OR itself:
+    // measured on the reference videos, most windows carry several 0.9+
+    // categories and `score` saturates at 1.0000 in float64, which would make
+    // the order arbitrary. Sum of log(1 - s) is the same ranking with the
+    // resolution intact (more negative = stronger).
+    const strength = (window: FlagWindow) =>
+      window.categories.reduce((sum, c) => sum + Math.log(Math.max(1 - c.score, Number.MIN_VALUE)), 0);
+    windows.sort((a, b) => strength(a) - strength(b) || a.contextFrom - b.contextFrom);
+
+    const calls = windows.reduce((total, window) => total + window.categories.length, 0);
+    this.logger.log(
+      `[NLI] ${candidates.length} candidates (${sentenceLevel.length} sentence + ${windowLevel.length} window) ` +
+      `-> ${windows.length} verification windows, ${calls} (window, category) verify calls ` +
+      `(one call per candidate would have been ${candidates.length})`,
+    );
+    return windows;
   }
 
   /** One request/response round trip against the resident worker. */

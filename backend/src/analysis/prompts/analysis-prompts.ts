@@ -370,14 +370,51 @@ ${chapterText}`;
 }
 
 /**
- * Verify ONE ranked candidate: does the marked sentence ASSERT the category's
- * proposition, or merely report/question/argue against it?
+ * The sensitivity dial, applied to the VERIFIER as one extra sentence.
+ *
+ * The ranker's half of the dial is a threshold (0.9 / 0.7 / 0.5) that decides
+ * which passages get asked about at all. That decides what is ASKED; it says
+ * nothing about how strictly the answer is judged, and until now the verifier
+ * asked with identical strictness at every setting — so turning the dial to 3
+ * bought a longer candidate list answered by the same hard grader. This is the
+ * dial's second half: what the verifier does with a passage that plausibly, but
+ * not unmistakably, asserts the claim.
+ *
+ * Sensitivity 2 adds NOTHING. It is the measured configuration (10/10 recall on
+ * the hand audit, 0 extras) and every word added to a prompt moves a model, so
+ * the calibrated setting keeps the calibrated prompt.
+ *
+ * Both clauses are POSITIVE instructions per the hygiene ruling in
+ * docs/youtube-metadata-spec.md §6.1 — they say which verdict to reach for, not
+ * which mistake to avoid, and neither carries an example.
+ */
+const VERIFICATION_EMPHASIS: Record<1 | 2 | 3, string> = {
+  1: 'Reserve "flag" for passages where the speaker states the claim outright as their own position.',
+  2: '',
+  3:
+    'A person reviews every flag before it is used, and a passage that is not flagged is never reviewed. ' +
+    'When the passage plausibly asserts the claim, answer "flag".',
+};
+
+/**
+ * Verify ONE (window, category) pair: does this PASSAGE contain the speaker
+ * asserting the category's proposition, or only reporting/questioning/arguing
+ * against it?
  *
  * This is the second half of the measured flag pipeline (see
  * nli-ranker.service.ts). The NLI ranker cannot tell stance apart — "these
  * candidates are communists" and "Republicans have been eager to paint them as
- * communists" both score ~0.98 on the same hypothesis — so every candidate it
- * produces gets exactly one question asked about it here.
+ * communists" both score ~0.98 on the same hypothesis — so every category a
+ * window fired gets exactly one question asked about it here.
+ *
+ * WHY A PASSAGE AND NOT A MARKED SENTENCE. The unit of scoring is the sentence;
+ * the unit of JUDGMENT is the passage the ranker's hot sentences were expanded
+ * into. Asking about a marked sentence produced one stored section per sentence,
+ * and a speaker who spends four sentences on one point came back as four
+ * back-to-back flags for a single moment. One question per passage means one
+ * verdict per passage, which is what makes one section per moment possible —
+ * and the neighbouring sentences that used to be labelled "context" are now
+ * part of what is being judged, which is also what a human reviewer would do.
  *
  * WHAT THIS PROMPT DELIBERATELY DOES NOT CONTAIN, per the hygiene ruling in
  * docs/youtube-metadata-spec.md §6.1: no incorrect examples, no ban lists.
@@ -387,32 +424,26 @@ ${chapterText}`;
  * It keeps the spirit of buildFlagExtractionPrompt's promoting-vs-debunking
  * guard, which is the #1 correctness axis for this counter-apologetics use case
  * (the operator's own commentary must never flag itself for quoting the thing
- * it criticizes) — but scoped to ONE sentence with its neighbours as context,
- * instead of a whole chapter's stance.
+ * it criticizes) — scoped to one passage and one claim instead of a whole
+ * chapter's stance and an open-ended list of findings.
  */
 export function buildFlagVerificationPrompt(
-  candidateText: string,
-  contextBefore: string[],
-  contextAfter: string[],
+  passage: string[],
   categoryName: string,
   stanceProposition: string,
+  sensitivity?: number,
 ): string {
-  const lines = [
-    ...contextBefore.map((t) => `    ${t}`),
-    `>>> ${candidateText}`,
-    ...contextAfter.map((t) => `    ${t}`),
-  ].join('\n');
+  const emphasis = VERIFICATION_EMPHASIS[normalizeSensitivity(sensitivity)];
+  return `Transcript passage.
 
-  return `Transcript excerpt. Judge ONLY the line marked >>>; the other lines are context.
-
-${lines}
+${passage.join('\n')}
 
 CLAIM (${categoryName}): ${stanceProposition}
 
-Question: in the line marked >>>, is the speaker asserting or promoting that claim as their own position?
+Question: anywhere in this passage, is the speaker asserting or promoting that claim as their own position?
 Answer "flag" if the speaker asserts it, endorses it, or repeats it approvingly as true.
-Answer "skip" if the speaker is reporting that other people make that claim, quoting it neutrally, asking about it, arguing against it, or if the line does not make that claim at all.
-
+Answer "skip" if the speaker is reporting that other people make that claim, quoting it neutrally, asking about it, arguing against it, or if the passage does not make that claim at all.
+${emphasis ? `${emphasis}\n` : ''}
 Respond with JSON only: {"verdict":"flag"} or {"verdict":"skip"}`;
 }
 
