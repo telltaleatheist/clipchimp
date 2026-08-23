@@ -518,14 +518,35 @@ export class AIAnalysisService {
    * Returns {} on any read/parse failure — routing is an optimization, and a
    * malformed config must not take the whole analysis down.
    */
+  /**
+   * The stored default sensitivity (app-config `defaultGranularity`), used when
+   * a caller does not pass `analysisGranularity`. Some entry points (the
+   * standalone analysis controller path) never plumbed the option, which
+   * silently ran them at the hardcoded prompt default regardless of the user's
+   * setting — defaulting HERE honors the dial for every caller, present and
+   * future. Callers that do pass a value are unaffected.
+   */
+  private loadDefaultGranularity(): number | undefined {
+    try {
+      const raw = JSON.parse(fs.readFileSync(this.appConfigPath(), 'utf8'))?.defaultGranularity;
+      return typeof raw === 'number' && Number.isFinite(raw) ? raw : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private appConfigPath(): string {
+    const userDataPath =
+      process.env.APPDATA ||
+      (process.platform === 'darwin'
+        ? path.join(process.env.HOME || '', 'Library', 'Application Support')
+        : path.join(process.env.HOME || '', '.config'));
+    return path.join(userDataPath, 'briefcase', 'app-config.json');
+  }
+
   private loadTaskModelOverrides(): Partial<Record<AITaskKind, string>> {
     try {
-      const userDataPath =
-        process.env.APPDATA ||
-        (process.platform === 'darwin'
-          ? path.join(process.env.HOME || '', 'Library', 'Application Support')
-          : path.join(process.env.HOME || '', '.config'));
-      const configPath = path.join(userDataPath, 'briefcase', 'app-config.json');
+      const configPath = this.appConfigPath();
       if (!fs.existsSync(configPath)) return {};
 
       const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'))?.taskModels;
@@ -719,11 +740,19 @@ export class AIAnalysisService {
       videoTitle = '',
       categories,
       customInstructions,
-      analysisGranularity,
       apiKey,
       ollamaEndpoint,
       onProgress,
     } = options;
+
+    // Sensitivity: an explicit value wins; otherwise the user's stored default
+    // (see loadDefaultGranularity — some entry points never pass the option).
+    const analysisGranularity = options.analysisGranularity ?? this.loadDefaultGranularity();
+    if (options.analysisGranularity === undefined && analysisGranularity !== undefined) {
+      this.logger.log(
+        `[Sensitivity] Caller passed none — using stored default ${analysisGranularity}`,
+      );
+    }
 
     // Strip provider prefix from model if present (shared parser, one source of
     // truth across all entry points), e.g. "local:cogito-8b" -> "cogito-8b".
