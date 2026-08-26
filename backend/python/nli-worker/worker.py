@@ -71,7 +71,19 @@ def main():
     from transformers import pipeline
     import torch
 
-    device = 'mps' if torch.backends.mps.is_available() else -1
+    # Accelerator by platform, in the order each platform can actually offer one.
+    # macOS has no CUDA and Metal is the only accelerator there; Windows and
+    # Linux have no Metal and CUDA is the only one. -1 is the CPU fallback on
+    # every platform, and it is a fallback, not a failure: the pipeline is
+    # correct on CPU, just slower. The value is passed to the pipeline as-is,
+    # so it stays in torch's own vocabulary ('mps', 0 = cuda:0, -1 = cpu), and
+    # that same value is what the ready line reports to the parent.
+    if sys.platform == 'darwin':
+        device = 'mps' if torch.backends.mps.is_available() else -1
+    elif torch.cuda.is_available():
+        device = 0
+    else:
+        device = -1
     clf = pipeline('zero-shot-classification', model=MODEL, device=device)
 
     print(json.dumps({'ready': True, 'device': str(device), 'model': MODEL}), flush=True)

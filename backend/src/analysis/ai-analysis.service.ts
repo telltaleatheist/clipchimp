@@ -172,6 +172,13 @@ export interface AnalysisResult {
   description?: string | null;
   suggested_title?: string;
   tokenStats?: TokenStats;
+  /**
+   * Non-fatal degradations the user should know about, carried out to the queue
+   * job (TaskResult.warnings -> job.warnings) where the library and queue
+   * surfaces already render them. Currently used for exactly one thing: saying
+   * out loud when flag detection ran the weaker fallback path.
+   */
+  warnings?: string[];
 }
 
 // =============================================================================
@@ -1074,7 +1081,7 @@ export class AIAnalysisService {
       // PASS 2: Analyze each chapter (title, summary), then extract flags (2b)
       // =========================================================================
       sendProgress('analysis', 26, `Analyzing ${boundaries.length} chapters (0/${totalApiCalls} API calls)...`);
-      const { chapters, flags } = await this.analyzeChaptersPass2(
+      const { chapters, flags, warnings: flagWarnings } = await this.analyzeChaptersPass2(
         aiConfig,
         segments,
         boundaries,
@@ -1265,6 +1272,7 @@ export class AIAnalysisService {
         description,
         suggested_title: suggestedTitle || undefined,
         tokenStats: tokenStats.apiCalls > 0 ? tokenStats : undefined,
+        warnings: flagWarnings && flagWarnings.length > 0 ? flagWarnings : undefined,
       };
     } catch (error) {
       const message = `AI analysis failed: ${(error as Error).message}`;
@@ -2012,13 +2020,14 @@ export class AIAnalysisService {
     taskModels: Partial<Record<AITaskKind, string>> = {},
     onFlagProgress?: (current: number, total: number) => void,
     onFlagStatus?: (message: string) => void,
-  ): Promise<{ chapters: Chapter[]; flags: AnalyzedSection[] }> {
+  ): Promise<{ chapters: Chapter[]; flags: AnalyzedSection[]; warnings?: string[] }> {
     const chapters: Chapter[] = [];
+    const warnings: string[] = [];
     const allFlags: AnalyzedSection[] = [];
 
     if (!segments || segments.length === 0) {
       this.logger.warn('[Pass 2] No segments available for chapter analysis');
-      return { chapters, flags: allFlags };
+      return { chapters, flags: allFlags, warnings };
     }
 
     const videoDuration = segments[segments.length - 1].end;
@@ -2194,9 +2203,26 @@ export class AIAnalysisService {
           // for one moment; this path already emits exactly one section per
           // window, so there is nothing left for it to find and a real risk it
           // would delete a legitimately distinct neighbouring passage.
-          return { chapters, flags: ranked };
+          return { chapters, flags: ranked, warnings };
         }
         unavailableReason = 'NLI ranking failed mid-run';
+      }
+
+      // SAY SO WHERE THE USER LOOKS, NOT ONLY IN THE LOG.
+      //
+      // The line below is the honest record for whoever reads the server log;
+      // nobody else ever will. This degradation changes the RESULT the user is
+      // about to look at — fewer flags, found by a weaker method — so it also
+      // goes onto the job as a warning, which the queue row and the library card
+      // already render (TaskResult.warnings -> job.warnings). No new channel and
+      // no new UI: this is the one that already exists for exactly this kind of
+      // "it worked, but not the way you think" outcome.
+      //
+      // BRIEFCASE_FLAGS_DISCOVERY=1 is excluded on purpose: that is a deliberate
+      // operator override, and warning somebody about a thing they just asked for
+      // is noise.
+      if (!FLAGS_DISCOVERY) {
+        warnings.push(this.nliRanker.userFacingUnavailableMessage(unavailableReason));
       }
 
       // THE DISCOVERY PATH KEEPS THE DIAL. It cannot capture wide and re-filter:
@@ -2332,7 +2358,7 @@ export class AIAnalysisService {
     }
 
     this.logger.log(`[Pass 2] Analyzed ${chapters.length} chapters, found ${deduplicatedFlags.length} category flags`);
-    return { chapters, flags: deduplicatedFlags };
+    return { chapters, flags: deduplicatedFlags, warnings };
   }
 
   /**

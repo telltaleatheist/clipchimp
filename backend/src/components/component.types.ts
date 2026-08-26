@@ -7,7 +7,16 @@
  * mirror). Each component has per-(platform, arch) artifacts.
  */
 
-export type ComponentKind = 'binary' | 'whisper-model' | 'llama-model';
+/**
+ * 'python-env' is the odd one out and deliberately so: it is not downloaded
+ * from anywhere. It is a Python virtualenv plus a pre-seeded Hugging Face model
+ * that the app CONSTRUCTS locally from an interpreter the user already has,
+ * because a virtualenv is not portable between machines and there is no
+ * artifact to publish. It travels through the same component surface (list,
+ * install, progress, remove) so the user meets it in the same place as
+ * everything else. See backend/src/common/nli-env.ts.
+ */
+export type ComponentKind = 'binary' | 'whisper-model' | 'llama-model' | 'python-env';
 
 export interface ComponentArtifact {
   platform: 'darwin' | 'win32' | 'linux';

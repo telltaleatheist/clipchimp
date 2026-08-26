@@ -33,6 +33,13 @@ export class ComponentsPaneComponent {
   tools = computed(() => this.all().filter(c => c.kind === 'binary' && c.supported));
   whisperModels = computed(() => this.all().filter(c => c.kind === 'whisper-model' && c.supported));
   llamaModels = computed(() => this.all().filter(c => c.kind === 'llama-model' && c.supported));
+  /**
+   * Locally-built Python environments (currently only the NLI flag ranker).
+   * Listed apart from the downloads because it is not one: it is constructed
+   * from a Python already on the machine, so its failure modes ("no interpreter
+   * found") and its fix ("Repair") are different from a download's.
+   */
+  pythonEnvs = computed(() => this.all().filter(c => c.kind === 'python-env' && c.supported));
 
   constructor() {
     this.reload();
@@ -104,6 +111,17 @@ export class ComponentsPaneComponent {
 
   cancelRemove(): void {
     this.confirmingRemoveId.set(null);
+  }
+
+  /**
+   * Rebuild an already-present environment. Uses the same queue and the same
+   * dock as an install — it IS an install, with force set, so a broken venv is
+   * torn down and remade instead of being detected as "already there".
+   */
+  repair(component: ComponentStatus): void {
+    if (this.isBusy(component)) return;
+    this.dl.select([component.id]);
+    this.dl.enqueue([component.id], true);
   }
 
   openWizard(): void {

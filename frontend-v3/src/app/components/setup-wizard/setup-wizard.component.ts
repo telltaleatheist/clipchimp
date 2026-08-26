@@ -70,6 +70,13 @@ type Step = 'welcome' | 'tools' | 'models' | 'ai' | 'review' | 'finishing';
                     <ng-container *ngTemplateOutlet="card; context: { $implicit: c, locked: false }"></ng-container>
                   }
                 }
+                @if (pythonEnvs().length) {
+                  <div class="group-label">Flag detection — recommended</div>
+                  @for (c of pythonEnvs(); track c.id) {
+                    <ng-container *ngTemplateOutlet="card; context: { $implicit: c, locked: false, recommended: true }"></ng-container>
+                  }
+                  <p class="hint">Skip it and flag detection still works — it falls back to a per-chapter AI pass, which is slower and finds fewer flags. You can add it later from Settings.</p>
+                }
               </div>
             }
 
@@ -229,7 +236,7 @@ type Step = 'welcome' | 'tools' | 'models' | 'ai' | 'review' | 'finishing';
     </div>
 
     <!-- select card template -->
-    <ng-template #card let-c let-locked="locked">
+    <ng-template #card let-c let-locked="locked" let-recommended="recommended">
       <label class="select-card"
              [class.checked]="isChecked(c)"
              [class.installed]="c.installed">
@@ -237,6 +244,7 @@ type Step = 'welcome' | 'tools' | 'models' | 'ai' | 'review' | 'finishing';
         <div class="select-info">
           <div class="select-name">{{ c.name }}
             @if (locked) { <span class="badge badge-rec">Required</span> }
+            @else if (recommended) { <span class="badge badge-accent">Recommended</span> }
           </div>
           @if (c.description) { <div class="select-desc">{{ c.description }}</div> }
         </div>
@@ -280,6 +288,15 @@ export class SetupWizardComponent implements OnInit {
   readonly optionalTools = computed(() =>
     this.all().filter((c) => c.kind === 'binary' && !c.required && c.supported && c.id !== 'llama'),
   );
+  /**
+   * Locally-built Python environments (the NLI flag ranker). Offered on the
+   * tools step because that is what it is — a tool — and NOT pre-selected,
+   * unlike the required binaries and the default whisper model: it needs a
+   * system Python 3.9+, and silently queueing a 1.2GB build that fails on every
+   * machine without one is worse than an unticked box with a "Recommended"
+   * badge and a line saying what skipping it costs.
+   */
+  readonly pythonEnvs = computed(() => this.all().filter((c) => c.kind === 'python-env' && c.supported));
   readonly models = computed(() => this.all().filter((c) => c.kind === 'whisper-model' && c.supported));
   readonly llamaModels = computed(() => this.all().filter((c) => c.kind === 'llama-model' && c.supported));
   readonly reviewItems = computed(() => this.all().filter((c) => this.dl.isSelected(c.id) && !c.installed));

@@ -116,6 +116,46 @@
 </div>
 
 <div class="pane-section">
+  <p class="section-label">Flag detection</p>
+  <p class="hint" style="margin: 0 0 10px;">
+    Built on this computer from a Python you already have — nothing is downloaded
+    except the ranking model. Without it, flag detection still works, but falls
+    back to a per-chapter AI pass that is slower and finds fewer flags.
+  </p>
+  @for (component of pythonEnvs(); track component.id) {
+    <div class="row-card">
+      <div class="row-main">
+        <div class="row-name">{{ component.name }}</div>
+        @if (component.description) {
+          <div class="row-desc">{{ component.description }}</div>
+        }
+      </div>
+      <span class="row-meta">{{ component.installed ? '' : fmtSize(component.sizeBytes) }}</span>
+      @if (isBusy(component)) {
+        <span class="pill accent">{{ statusOf(component.id) === 'downloading' ? pctOf(component.id) + '%' : 'Queued' }}</span>
+      } @else if (component.installed) {
+        <span class="pill ok">Installed</span>
+        <ui-button variant="ghost" size="sm" (pressed)="repair(component)">Repair</ui-button>
+        @if (canRemove(component)) {
+          @if (confirmingRemoveId() === component.id) {
+            <ui-button variant="secondary" size="sm" (pressed)="remove(component)">Remove?</ui-button>
+            <ui-button variant="ghost" size="sm" (pressed)="cancelRemove()">Keep</ui-button>
+          } @else {
+            <ui-button variant="ghost" size="sm" (pressed)="remove(component)">
+              {{ removingId() === component.id ? 'Removing…' : 'Remove' }}
+            </ui-button>
+          }
+        }
+      } @else {
+        <ui-button variant="secondary" size="sm" (pressed)="download(component)">Install</ui-button>
+      }
+    </div>
+  } @empty {
+    <p class="hint">Not available on this platform.</p>
+  }
+</div>
+
+<div class="pane-section">
   <p class="section-label">Guided installer</p>
   <div class="actions-row">
     <ui-button variant="secondary" (pressed)="openWizard()">Open guided installer…</ui-button>

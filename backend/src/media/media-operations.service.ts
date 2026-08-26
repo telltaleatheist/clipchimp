@@ -794,6 +794,11 @@ export class MediaOperationsService {
         data: {
           sectionsCount: analysisResult.sections_count || 0,
         },
+        // Non-fatal degradations from the analysis itself (currently: flag
+        // detection fell back to the per-chapter LLM pass because the NLI
+        // ranking environment is missing). QueueManagerService merges these onto
+        // job.warnings, which the queue row and library card already render.
+        warnings: analysisResult.warnings,
       };
     } catch (error) {
       this.logger.error(`Analysis failed: ${error instanceof Error ? error.message : 'Unknown error'}`);

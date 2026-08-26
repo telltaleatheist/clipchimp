@@ -33,6 +33,14 @@ export class SetupDownloadService {
 
   private draining = false;
   private resolveCurrent: (() => void) | null = null;
+  /**
+   * Ids queued as a REPAIR rather than a fresh install. Only meaningful for
+   * locally-constructed components (the NLI Python environment), where the
+   * backend would otherwise see a directory that already looks present and
+   * no-op. Cleared as each item starts, so a later ordinary install of the same
+   * id is not silently forced too.
+   */
+  private forceIds = new Set<string>();
 
   // Stall watchdog: if the in-flight item goes silent for this long (no progress
   // events and no terminal 'component.download.*' WS event, e.g. a backend crash
@@ -113,9 +121,25 @@ export class SetupDownloadService {
   }
 
   // ---------- queue ----------
-  /** Queue the given ids (or the current selection) and start draining. */
-  enqueue(ids?: string[]): void {
+  /**
+   * Queue the given ids (or the current selection) and start draining.
+   * `force` marks them as repairs — see forceIds.
+   */
+  enqueue(ids?: string[], force = false): void {
     const toAdd = ids ?? Array.from(this.selected());
+    if (force) {
+      toAdd.forEach((id) => this.forceIds.add(id));
+      // A repair is by definition a re-run of something that already finished
+      // (or failed) in this session. Clear its terminal state first, otherwise
+      // nextToRun() skips it and the button does nothing.
+      this.doneIds.update((d) => new Set([...d].filter((id) => !toAdd.includes(id))));
+      this.failed.update((f) => {
+        const next = { ...f };
+        toAdd.forEach((id) => delete next[id]);
+        return next;
+      });
+      this.order.update((o) => o.filter((id) => !toAdd.includes(id)));
+    }
     const existing = new Set(this.order());
     const additions = toAdd.filter((id) => !existing.has(id));
     if (additions.length > 0) {
@@ -199,7 +223,8 @@ export class SetupDownloadService {
           this.resolveCurrent = resolve;
           // Guard against a terminal WS event that never arrives.
           this.armWatchdog(id as string);
-          this.components.installComponent(id as string).subscribe({
+          const force = this.forceIds.delete(id as string);
+          this.components.installComponent(id as string, force).subscribe({
             next: (res) => {
               // HTTP 200 with success:false (unsupported platform, "already
               // downloading", backend refusal) is neither an HTTP error nor a

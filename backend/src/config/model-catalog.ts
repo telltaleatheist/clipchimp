@@ -11,6 +11,12 @@
  */
 
 import { ComponentArtifact, ManifestComponent } from '../components/component.types';
+import {
+  NLI_COMPONENT_ID,
+  NLI_COMPONENT_NAME,
+  NLI_COMPONENT_DESCRIPTION,
+  NLI_INSTALL_BYTES,
+} from '../common/nli-env';
 
 const HF_WHISPER = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main';
 
@@ -165,4 +171,31 @@ export function llamaModelComponents(): ManifestComponent[] {
       m.filename,
     ),
   }));
+}
+
+/**
+ * The NLI flag-ranking environment, as a component.
+ *
+ * IT HAS AN ARTIFACT AND NOTHING IS EVER DOWNLOADED FROM IT. pickArtifact() is
+ * how the component surface answers "is this supported on this machine?" and
+ * "how big is it?", and both answers are real here: it is supported everywhere
+ * (any platform with a Python 3.9+ interpreter can build it) and its size is the
+ * measured on-disk size of a finished environment. Synthesising a platform-
+ * agnostic artifact with an empty url keeps pickArtifact, the single-active-
+ * install guard, and the abort handling in install() exactly as they are, rather
+ * than threading a second "does this component need an artifact" concept through
+ * all of them. The url is empty because the install path for this KIND never
+ * looks at it — see installPythonEnv.
+ */
+export function nliEnvComponents(): ManifestComponent[] {
+  return [
+    {
+      id: NLI_COMPONENT_ID,
+      name: NLI_COMPONENT_NAME,
+      kind: 'python-env',
+      required: false,
+      description: NLI_COMPONENT_DESCRIPTION,
+      artifacts: universalArtifacts('', '', NLI_INSTALL_BYTES, 'worker.py'),
+    },
+  ];
 }

@@ -49,6 +49,12 @@
  */
 import { Injectable, Logger, OnApplicationShutdown } from '@nestjs/common';
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import {
+  NLI_COMPONENT_NAME,
+  checkNliEnv,
+  nliVenvPython,
+  resolveNliDir,
+} from '../common/nli-env';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -723,34 +729,18 @@ export class NliRankerService implements OnApplicationShutdown {
    * `nliWorkerDir` in app-config.json, then the app-support default. Same config
    * file and same fall-through-on-unreadable behavior as `taskModels` and
    * `embeddingModel`.
+   *
+   * The resolution itself lives in common/nli-env, SHARED with the component
+   * manager that builds the environment. A provisioner writing to a different
+   * directory than the ranker reads from would report success and change
+   * nothing, so there is exactly one answer to "where is it".
    */
   resolveWorkerDir(): string {
-    const fromEnv = process.env.BRIEFCASE_NLI_DIR?.trim();
-    if (fromEnv) return fromEnv;
-
-    const userDataPath =
-      process.env.APPDATA ||
-      (process.platform === 'darwin'
-        ? path.join(process.env.HOME || '', 'Library', 'Application Support')
-        : path.join(process.env.HOME || '', '.config'));
-
-    try {
-      const configPath = path.join(userDataPath, 'briefcase', 'app-config.json');
-      if (fs.existsSync(configPath)) {
-        const configured = JSON.parse(fs.readFileSync(configPath, 'utf8'))?.nliWorkerDir;
-        if (typeof configured === 'string' && configured.trim()) return configured.trim();
-      }
-    } catch (error) {
-      this.logger.warn(`[NLI] Ignoring unreadable nliWorkerDir config: ${(error as Error).message}`);
-    }
-
-    return path.join(userDataPath, 'briefcase', 'nli');
+    return resolveNliDir((message) => this.logger.warn(`[NLI] ${message}`));
   }
 
   private pythonPath(dir: string): string {
-    return process.platform === 'win32'
-      ? path.join(dir, 'venv', 'Scripts', 'python.exe')
-      : path.join(dir, 'venv', 'bin', 'python');
+    return nliVenvPython(dir);
   }
 
   /**
@@ -921,6 +911,25 @@ export class NliRankerService implements OnApplicationShutdown {
     return this.unavailableReason;
   }
 
+  /**
+   * The same fact as `unavailable`, phrased for someone who is not reading a
+   * server log — used as the analysis job's warning when the flag pipeline
+   * degrades. It says what changed about the RESULT, not what is missing from
+   * the filesystem, because a user looking at a finished analysis needs to know
+   * their flags came from the weaker path before they need a diagnosis.
+   */
+  userFacingUnavailableMessage(reason: string): string {
+    // The log's reason names every missing file with its absolute path, which is
+    // right for a log and wrong for a one-line badge on a queue row. Trim it —
+    // the untruncated version is one grep away in the server log.
+    const short = reason.length > 140 ? `${reason.slice(0, 137)}...` : reason;
+    return (
+      `Flags were found with the fallback method (one AI pass per chapter), which is slower and finds fewer ` +
+      `of them: the "${NLI_COMPONENT_NAME}" component is not installed or is incomplete. ` +
+      `Install it from Settings -> Components and re-run the analysis for the full flag pass. (${short})`
+    );
+  }
+
   private async start(): Promise<boolean> {
     if (this.starting) return this.starting;
     this.starting = this.doStart().finally(() => {
@@ -934,7 +943,17 @@ export class NliRankerService implements OnApplicationShutdown {
     const python = this.pythonPath(dir);
     const worker = path.join(dir, 'worker.py');
 
-    if (!fs.existsSync(dir)) return this.markUnavailable(`worker directory not found: ${dir}`);
+    // The SAME check the component manager reports "Installed" with. Sharing it
+    // is what keeps the settings pane from claiming an environment is present
+    // while every analysis quietly degrades — see common/nli-env.ts.
+    const env = checkNliEnv(dir);
+    if (!env.installed) {
+      return this.markUnavailable(
+        `flag-ranking environment at ${dir} is incomplete (missing: ${env.missing.join(', ')}). ` +
+        `Install "${NLI_COMPONENT_NAME}" from Settings -> Components.`,
+      );
+    }
+    // Belt and braces: the two paths the spawn below cannot recover from.
     if (!fs.existsSync(worker)) return this.markUnavailable(`worker.py not found in ${dir}`);
     if (!fs.existsSync(python)) return this.markUnavailable(`venv python not found: ${python}`);
 

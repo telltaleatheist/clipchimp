@@ -27,7 +27,15 @@ import {
   InstalledManifest,
   InstalledRecord,
 } from './component.types';
-import { whisperModelComponents, llamaModelComponents } from '../config/model-catalog';
+import { whisperModelComponents, llamaModelComponents, nliEnvComponents } from '../config/model-catalog';
+import {
+  NLI_COMPONENT_ID,
+  NLI_STAGES,
+  checkNliEnv,
+  provisionNliEnv,
+  removeNliEnv,
+  resolveNliDir,
+} from '../common/nli-env';
 
 const MANIFEST_URL =
   'https://github.com/telltaleatheist/briefcase/releases/download/binaries-v1/manifest.json';
@@ -88,7 +96,7 @@ export class ComponentManagerService implements OnModuleInit {
   private async getAllComponents(): Promise<ManifestComponent[]> {
     const manifest = await this.getManifest();
     const binaries = manifest.components.filter((c) => c.kind === 'binary');
-    return [...binaries, ...whisperModelComponents(), ...llamaModelComponents()];
+    return [...binaries, ...whisperModelComponents(), ...llamaModelComponents(), ...nliEnvComponents()];
   }
 
   // ---------- manifest ----------
@@ -209,6 +217,13 @@ export class ComponentManagerService implements OnModuleInit {
   }
 
   isInstalled(id: string): boolean {
+    // The Python environment is not a file we downloaded, so "the entry exists"
+    // is not a strong enough claim for it: worker.py can be sitting next to a
+    // venv with no torch in it. Its own check is the authority, and it is the
+    // SAME function the ranker uses to decide whether to run — see nli-env.ts.
+    if (id === NLI_COMPONENT_ID) {
+      return checkNliEnv(resolveNliDir((m) => this.logger.warn(`[NLI] ${m}`))).installed;
+    }
     const installed = this.loadInstalled();
     const rec = installed.components[id];
     if (!rec) return false;
@@ -231,12 +246,23 @@ export class ComponentManagerService implements OnModuleInit {
         supported: art !== null,
         installed: this.isInstalled(c.id),
         sizeBytes: art?.bytes ?? 0,
-        installedAt: this.loadInstalled().components[c.id]?.installedAt,
+        // A hand-built NLI environment has no install record, so fall back to
+        // the date its own verification marker records.
+        installedAt:
+          this.loadInstalled().components[c.id]?.installedAt ??
+          (c.id === NLI_COMPONENT_ID
+            ? (checkNliEnv(resolveNliDir()).recorded?.verifiedAt as string | undefined)
+            : undefined),
       };
     });
   }
 
-  async install(id: string): Promise<void> {
+  /**
+   * Install a component. `force` is the repair path: it is only meaningful for
+   * locally-constructed components (python-env), where "already installed" is a
+   * judgement about a directory rather than a file we can re-download.
+   */
+  async install(id: string, force = false): Promise<void> {
     const components = await this.getAllComponents();
     const component = components.find((c) => c.id === id);
     if (!component) throw new Error(`Unknown component: ${id}`);
@@ -246,17 +272,26 @@ export class ComponentManagerService implements OnModuleInit {
 
     // Reject if ANY download is active, including the same id — a double-click
     // would otherwise open a second concurrent stream to the same file and
-    // corrupt it.
+    // corrupt it. A python-env build is held to the same rule: two pips writing
+    // one venv is the same corruption with a different filename.
     if (this.activeDownload) {
       throw new Error(`Download already in progress: ${this.activeDownload.componentId}`);
     }
 
     const controller = new AbortController();
     this.activeDownload = { componentId: id, controller };
-    this.emitProgress(id, 'download', 0, artifact.bytes);
+    // A python-env has no bytes arriving over a socket, so it opens on the
+    // 'install' phase at stage 0 rather than claiming a download of 1.2GB.
+    if (component.kind === 'python-env') {
+      this.emitProgress(id, 'install', 0, NLI_STAGES.length);
+    } else {
+      this.emitProgress(id, 'download', 0, artifact.bytes);
+    }
 
     try {
-      if (component.kind === 'whisper-model') {
+      if (component.kind === 'python-env') {
+        await this.installPythonEnv(id, artifact, controller.signal, force);
+      } else if (component.kind === 'whisper-model') {
         await this.installModel(id, artifact, controller.signal);
       } else if (component.kind === 'llama-model') {
         await this.installLlamaModel(id, artifact, controller.signal);
@@ -300,6 +335,22 @@ export class ComponentManagerService implements OnModuleInit {
 
   async remove(id: string): Promise<void> {
     const installed = this.loadInstalled();
+
+    // The Python environment can exist without an install record (built by hand,
+    // or by a build that crashed before recording), so removal is driven by the
+    // resolved directory rather than the record — otherwise "Remove" would look
+    // like it worked and leave 1.2GB behind.
+    if (id === NLI_COMPONENT_ID) {
+      const dir = resolveNliDir((m) => this.logger.warn(`[NLI] ${m}`));
+      const deleted = removeNliEnv(dir);
+      this.logger.log(deleted ? `Removed NLI environment at ${dir}` : `No NLI environment at ${dir} to remove`);
+      if (installed.components[id]) {
+        delete installed.components[id];
+        this.saveInstalled(installed);
+      }
+      return;
+    }
+
     const rec = installed.components[id];
     if (!rec) return;
 
@@ -362,6 +413,54 @@ export class ComponentManagerService implements OnModuleInit {
       bytes: artifact.bytes,
       installedAt: new Date().toISOString(),
     });
+  }
+
+  /**
+   * Build the NLI flag-ranking Python environment.
+   *
+   * PROGRESS IS BY STAGE, NOT BY BYTE, ON PURPOSE. pip and the Hugging Face hub
+   * client do not report a total this process can see, and a bar synthesised
+   * from nothing is worse than no bar: it would sit at a fake 40% through a
+   * ten-minute torch download. So the five stages in NLI_STAGES are the unit,
+   * `done` is the number completed, and a heartbeat re-emits the current stage
+   * every 15s while a child process is working — silence is what the download
+   * dock's watchdog treats as a hang, and this work is legitimately silent for
+   * minutes at a time.
+   *
+   * The install record is written for consistency with the other kinds, but it
+   * is NOT what isInstalled() reads for this component: see isInstalled.
+   */
+  private async installPythonEnv(
+    id: string,
+    artifact: ComponentArtifact,
+    signal: AbortSignal,
+    force: boolean,
+  ): Promise<void> {
+    const dir = resolveNliDir((m) => this.logger.warn(`[NLI] ${m}`));
+    const total = NLI_STAGES.length;
+
+    await provisionNliEnv({
+      dir,
+      signal,
+      force,
+      onStage: (done, stages, label) => {
+        this.logger.log(`[${id}] stage ${done}/${stages}: ${label}`);
+        this.emitProgress(id, 'install', done, stages);
+      },
+      onHeartbeat: (done, stages) => this.emitProgress(id, 'install', done, stages),
+      log: (message) => this.logger.log(`[${id}] ${message}`),
+    });
+
+    this.recordInstalled({
+      id,
+      kind: 'python-env',
+      dir,
+      entry: 'worker.py',
+      sha256: '',
+      bytes: artifact.bytes,
+      installedAt: new Date().toISOString(),
+    });
+    this.logger.log(`[${id}] NLI flag-ranking environment ready at ${dir} (${total} stages complete)`);
   }
 
   private async installModel(id: string, artifact: ComponentArtifact, signal: AbortSignal): Promise<void> {
