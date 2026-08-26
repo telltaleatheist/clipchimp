@@ -116,30 +116,24 @@ export class OllamaService {
         return false;
       }
 
-      // Test model with simple prompt (ContentStudio's approach)
-      this.logger.log(`[Model Check] Step 2: Testing model response with generate request...`);
-      const response = await axios.post(
-        `${url}/api/generate`,
-        {
-          model: modelName,
-          prompt: 'Ready.',
-          stream: false,
-          keep_alive: '5m',  // Keep model loaded for 5 minutes after check
-          options: { num_predict: 5 }
-        },
-        { timeout: 300000 } // 300 second (5 minute) timeout to allow large model loading
-      );
-
+      // NO WARM-UP GENERATION. This check used to send a real `generate` to
+      // prove the model responds, which LOADED IT — measured at 10.9s and ~17GB
+      // of VRAM for qwen3.8:27b — before the pipeline had any use for it. The
+      // analysis pipeline's first stages run on the embedding model and a small
+      // placement model, so the main model then sat resident, idle, competing
+      // for VRAM with the models actually working.
+      //
+      // The tag-list check above already catches the failure that actually
+      // happens (model not pulled) at zero cost. A model that is present but
+      // genuinely broken surfaces on its first real call, which has retries,
+      // real error reporting and a real prompt to report about — a better place
+      // to discover it than a synthetic probe.
       const elapsedTime = ((Date.now() - startTime) / 1000).toFixed(1);
-
-      if (response.status === 200) {
-        this.logger.log(`[Model Check] ✓ Model ${modelName} is available and responding (took ${elapsedTime}s)`);
-        this.logger.log(`[Model Check] Response: ${JSON.stringify(response.data).substring(0, 100)}...`);
-        return true;
-      } else {
-        this.logger.error(`[Model Check] ✗ Model ${modelName} returned unexpected status ${response.status}`);
-        return false;
-      }
+      this.logger.log(
+        `[Model Check] ✓ Model ${modelName} is installed (took ${elapsedTime}s; not loaded — ` +
+          `it loads on first use, so it does not occupy VRAM before it is needed)`,
+      );
+      return true;
     } catch (error: any) {
       const elapsedTime = ((Date.now() - startTime) / 1000).toFixed(1);
 

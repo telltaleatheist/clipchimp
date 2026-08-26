@@ -1035,7 +1035,13 @@ export class AIAnalysisService {
       // one-per-chapter estimate and the flag stage corrects it the moment it
       // knows, exactly as the chapter loop corrects chapterCallCount after long
       // chapters are split.
-      let flagCallCount = chapterCallCount;
+      // Starts at ZERO — not at a one-per-chapter guess. Under capture-wide
+      // ranking the real number is routinely 10x a per-chapter estimate (83 vs
+      // 7 on the hour-long reference video), and a guess that wrong does not
+      // degrade gracefully: it made the bar sprint to 53% after a single
+      // chapter and then sit still. Unknown work claims no space until the
+      // ranker reports its actual count.
+      let flagCallCount = 0;
       const recomputeTotalApiCalls = () => {
         totalApiCalls = chapterCallCount + flagCallCount + 4 + pass1Calls;
       };
@@ -1045,11 +1051,24 @@ export class AIAnalysisService {
       // first counted call did — the placement stage, not Pass 2.
       pass2StartTime = pass1Calls > 0 ? pass1StartTime : Date.now();
 
-      // Progress callback that calculates percentage based on API calls
-      // Range: 25% to 95% (70% total for all API calls)
-      const calculateProgress = () => {
-        return Math.round(25 + (completedApiCalls / totalApiCalls) * 70);
-      };
+      // Progress is BANDED PER STAGE, not computed as a fraction of all calls.
+      //
+      // A global call-fraction requires knowing the total up front, and the flag
+      // stage's total is unknowable until its ranker has run — so the bar used
+      // to lurch (26% -> 53% on one chapter of seven) and then stall when the
+      // real count arrived. Bands make each stage's share fixed and its motion
+      // smooth: a stage that has not started occupies none of the bar, and a
+      // stage that discovers more work slows down inside its own band instead
+      // of stealing another stage's.
+      const PASS2_BAND: [number, number] = [26, 60];
+      const FLAG_BAND: [number, number] = [60, 90];
+      const METADATA_BAND: [number, number] = [90, 96];
+      const bandProgress = ([start, end]: [number, number], done: number, total: number) =>
+        Math.round(start + (Math.min(done, total) / Math.max(1, total)) * (end - start));
+      // Message-only ticks (stage announcements) report where their stage
+      // currently sits rather than recomputing a global fraction.
+      let lastProgress = PASS2_BAND[0];
+      const calculateProgress = () => lastProgress;
 
       // =========================================================================
       // PASS 2: Analyze each chapter (title, summary), then extract flags (2b)
@@ -1070,15 +1089,12 @@ export class AIAnalysisService {
           // Post-split chapter count is only known here; correct the estimate so
           // the ETA stops drifting when Pass 2 splits long chapters.
           if (total !== chapterCallCount) {
-            // Until the flag stage reports its own count, one-per-chapter stays
-            // the best available estimate for it.
-            if (flagCallCount === chapterCallCount) flagCallCount = total;
             chapterCallCount = total;
             recomputeTotalApiCalls();
           }
           completedApiCalls = pass1Calls + current;
-          const progress = calculateProgress();
-          sendProgress('analysis', progress, `Analyzing chapter ${current}/${total} (${completedApiCalls}/${totalApiCalls} API calls)...`);
+          lastProgress = bandProgress(PASS2_BAND, current, total);
+          sendProgress('analysis', lastProgress, `Analyzing chapter ${current}/${total}...`);
         },
         taskModels,
         (current, total) => {
@@ -1087,16 +1103,23 @@ export class AIAnalysisService {
             recomputeTotalApiCalls();
           }
           completedApiCalls = pass1Calls + chapterCallCount + current;
-          const progress = calculateProgress();
-          sendProgress('analysis', progress, `Finding flagged quotes ${current}/${total} (${completedApiCalls}/${totalApiCalls} API calls)...`);
+          lastProgress = bandProgress(FLAG_BAND, current, total);
+          sendProgress('analysis', lastProgress, `Verifying flag candidates ${current}/${total}...`);
         },
         // Ranking is one quick tick — seconds of local scoring, not a
         // generation call — so it reports a message at the CURRENT percentage
         // and is deliberately not counted in totalApiCalls (counting it would
         // poison the ETA's average-call-time, same as the embedding call).
-        (message) => sendProgress('analysis', calculateProgress(), message),
+        (message) => {
+          // Ranking runs at the START of the flag band: chapters are done, no
+          // verification has happened yet, and the candidate count is about to
+          // become known.
+          lastProgress = FLAG_BAND[0];
+          sendProgress('analysis', lastProgress, message);
+        },
       );
-      sendProgress('analysis', calculateProgress(), `Analyzed ${chapters.length} chapters, found ${flags.length} flags`);
+      lastProgress = METADATA_BAND[0];
+      sendProgress('analysis', lastProgress, `Analyzed ${chapters.length} chapters, found ${flags.length} flags`);
 
       // Honest-failure gate: if NOT ONE chapter was successfully analyzed, the
       // run produced nothing real (every API call failed). Fail loudly with the
@@ -1173,14 +1196,12 @@ export class AIAnalysisService {
         );
       }
 
+      let metadataStepsDone = 0;
       for (const key of orderedKeys) {
         for (const step of metadataSteps.filter((s) => s.key === key)) {
           completedApiCalls += step.calls;
-          sendProgress(
-            'analysis',
-            calculateProgress(),
-            `${step.label} (${completedApiCalls}/${totalApiCalls} API calls)...`,
-          );
+          lastProgress = bandProgress(METADATA_BAND, metadataStepsDone++, metadataSteps.length);
+          sendProgress('analysis', lastProgress, `${step.label}...`);
           switch (step.task) {
             case 'description':
               description = await this.generateDescriptionFromChapters(
