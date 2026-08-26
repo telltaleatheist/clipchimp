@@ -734,6 +734,12 @@ export class MediaOperationsService {
             description: section.description,
             category: section.category,
             source: 'ai',
+            // See analysis.service's copy of this insert: the ranked flag path
+            // stores accepted AND rejected verdicts with their ranker scores;
+            // every other path leaves both undefined, which writes NULL and
+            // reads back as a legacy flag.
+            verdict: section.verdict,
+            nliScore: section.nli_score,
           });
         }
         this.logger.log(`[${jobId || 'standalone'}] Saved ${analysisResult.sections.length} analysis sections`);

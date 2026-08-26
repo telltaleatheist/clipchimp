@@ -25,4 +25,18 @@
     box-shadow: 0 0 0 1px var(--primary-orange, #ff6b35), 0 2px 6px rgba(0, 0, 0, 0.3);
     z-index: 10;
   }
+
+  // GHOSTED: the verifier read this passage as reported/opposed rather than
+  // asserted, so it only appears at the LOOSE filter position. Dimmed and
+  // dashed, and pushed BEHIND solid markers so a real flag is never obscured by
+  // a rejection sitting over the same seconds of timeline.
+  &.ghosted {
+    opacity: 0.3;
+    border-style: dashed;
+    z-index: 0;
+
+    &:hover {
+      opacity: 0.6;
+    }
+  }
 }

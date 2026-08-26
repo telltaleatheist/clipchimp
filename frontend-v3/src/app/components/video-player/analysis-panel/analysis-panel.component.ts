@@ -2,6 +2,14 @@ import { Component, Input, Output, EventEmitter, signal, computed, inject, OnCha
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { TimelineSection, TimelineChapter, CategoryFilter, AnalysisData } from '../../../models/video-editor.model';
+import {
+  FlagFilter,
+  FLAG_FILTERS,
+  FLAG_FILTER_DESCRIPTION,
+  FLAG_FILTER_LABEL,
+  VERIFIER_REJECTION_LABEL,
+  isGhosted,
+} from '../../../models/flag-filter';
 import { TranscriptionSegment } from '../../../models/video-info.model';
 import { TranscriptSearchService, TranscriptSearchOptions } from '../../../services/transcript-search.service';
 
@@ -25,10 +33,20 @@ export class AnalysisPanelComponent implements OnChanges {
   @Input() hasAnalysis = false;
   @Input() videoId?: string;
   @Input() transcript: TranscriptionSegment[] = [];
+  /**
+   * The flag filter's current position, owned by the player (which does the
+   * actual filtering) and rendered here. `sections` above ALREADY has this
+   * filter applied — the control is here because this is where a user looks at
+   * findings, not because this component decides what is visible.
+   */
+  @Input() flagFilter: FlagFilter = 'moderate';
+  /** Per-position counts, so the control says what pressing it will do. */
+  @Input() flagFilterCounts: Record<FlagFilter, number> = { strict: 0, moderate: 0, loose: 0 };
   @Output() sectionClick = new EventEmitter<TimelineSection>();
   @Output() sectionDelete = new EventEmitter<string>(); // section id
   @Output() chapterClick = new EventEmitter<TimelineChapter>();
   @Output() chapterDelete = new EventEmitter<string>(); // chapter id
+  @Output() flagFilterChange = new EventEmitter<FlagFilter>();
   @Output() filterToggle = new EventEmitter<string>();
   @Output() filterSelectAll = new EventEmitter<void>();
   @Output() filterDeselectAll = new EventEmitter<void>();
@@ -269,6 +287,26 @@ export class AnalysisPanelComponent implements OnChanges {
   getCategoryColor(category: string): string {
     const filter = this.categoryFilters.find(f => f.category.toLowerCase() === category.toLowerCase());
     return filter?.color || '#6c757d';
+  }
+
+  // ---- flag filter -------------------------------------------------------
+  readonly flagFilterPositions = FLAG_FILTERS;
+  readonly flagFilterLabel = FLAG_FILTER_LABEL;
+  readonly flagFilterDescription = FLAG_FILTER_DESCRIPTION;
+  readonly verifierRejectionLabel = VERIFIER_REJECTION_LABEL;
+
+  onFlagFilterSelect(filter: FlagFilter): void {
+    if (filter !== this.flagFilter) this.flagFilterChange.emit(filter);
+  }
+
+  /**
+   * True for a passage the verifier REJECTED — one it read as reported, quoted,
+   * questioned or opposed rather than asserted. Only ever reaches this component
+   * at the LOOSE position, where it renders ghosted and captioned instead of
+   * being silently absent.
+   */
+  isGhostSection(section: TimelineSection): boolean {
+    return isGhosted(section);
   }
 
   isCategoryEnabled(category: string): boolean {

@@ -36,7 +36,15 @@ export type AnalysisQuality = 'fast' | 'thorough';
 export interface AIAnalyzeConfig {
   aiModel?: string; // Dynamic model string like "ollama:qwen2.5:7b" or "claude:claude-3-sonnet"
   customInstructions?: string;
-  analysisGranularity?: number; // 1-5: 1 = strong matches only, 5 = flag everything plausible
+  /**
+   * 1-5 sensitivity. OPTIONAL AND NO LONGER SET BY ANY UI — the slider was
+   * removed from every run-config surface when the dial became a display filter
+   * (see models/flag-filter.ts). It survives on the request model for API
+   * compatibility: the backend still accepts it, and the DISCOVERY fallback flag
+   * path still honors it. When absent, that path falls back to the config file's
+   * `defaultGranularity` and then to its own default of 2.
+   */
+  analysisGranularity?: number;
   generateSummary?: boolean;
   extractKeyPoints?: boolean;
   analysisQuality?: AnalysisQuality; // 'fast' = single-pass (cheaper), 'thorough' = multi-pass (better quotes)

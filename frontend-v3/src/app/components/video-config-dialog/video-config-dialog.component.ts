@@ -68,7 +68,6 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
     aiAnalysis: false,
     aiModel: '',
     customInstructions: '',
-    analysisGranularity: 2, // Default to middle (balanced)
     outputFormat: 'mp4',
     outputQuality: 'high'
   };
@@ -76,7 +75,6 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
   ngOnInit() {
     this.loadAIModels();
     this.loadInstructionsHistory();
-    this.loadDefaultGranularity();
 
     // Subscribe to model changes from other components (e.g., AI wizard)
     this.modelsChangedSub = this.aiSetupService.modelsChanged$.subscribe(async () => {
@@ -120,23 +118,12 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
     return text.substring(0, maxLength) + '...';
   }
 
-  getGranularityLabel(): string {
-    const value = this.settings.analysisGranularity || 2;
-    if (value <= 1) return 'Strong matches only';
-    if (value === 2) return 'Balanced';
-    if (value === 3) return 'Aggressive';
-    if (value === 4) return 'Very aggressive';
-    return 'Flag everything plausible';
-  }
-
-  getGranularityDescription(): string {
-    const value = this.settings.analysisGranularity || 2;
-    if (value <= 1) return 'Only explicit, unmistakable matches. Fewest false positives.';
-    if (value === 2) return 'Clear matches plus reasonably likely ones.';
-    if (value === 3) return 'Everything that could match, including implication and coded language. Expect more to review.';
-    if (value === 4) return 'Adds partial and implied matches on top of that. Expect a lot more to review, and a slower analysis.';
-    return 'Anything a passage could plausibly be. The most to review, and the slowest analysis.';
-  }
+  // THE DETECTION-SENSITIVITY SLIDER USED TO BE HERE, AND IS GONE ON PURPOSE.
+  // See process-config.component.ts for the full note: the analysis now captures
+  // everything and stores every verdict, the dial became a display filter in the
+  // video editor, and the operator removed the run-side control outright. This
+  // dialog no longer sets `analysisGranularity`; the stored `defaultGranularity`
+  // is config-file-only and read only by the discovery fallback flag path.
 
   getAudioLevelLabel(): string {
     const level = this.settings.audioLevel || -16;
@@ -152,33 +139,6 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
     return 'Loud - maximizes perceived volume, may reduce dynamic range';
   }
 
-  private loadDefaultGranularity() {
-    this.libraryService.getDefaultGranularity().subscribe({
-      next: (response) => {
-        if (response.success) {
-          this.settings.analysisGranularity = response.granularity;
-          console.log('Loaded default granularity:', response.granularity);
-        }
-      },
-      error: (error) => {
-        console.error('Failed to load default granularity:', error);
-      }
-    });
-  }
-
-  onGranularityChange() {
-    // Auto-save granularity when it changes
-    this.libraryService.saveDefaultGranularity(this.settings.analysisGranularity || 2).subscribe({
-      next: (response) => {
-        if (response.success) {
-          console.log('Saved default granularity:', response.granularity);
-        }
-      },
-      error: (error) => {
-        console.error('Failed to save default granularity:', error);
-      }
-    });
-  }
 
   ngOnChanges(changes: SimpleChanges) {
     // Reload models every time the modal opens to get the latest library default
@@ -501,7 +461,6 @@ export class VideoConfigDialogComponent implements OnInit, OnChanges, OnDestroy 
       aiAnalysis: false,
       aiModel: '', // Will be set from saved default when dialog reopens
       customInstructions: '',
-      analysisGranularity: 2, // Default to middle (balanced)
       outputFormat: 'mp4',
       outputQuality: 'high'
     };

@@ -186,30 +186,6 @@
                 }
               }
               @case ('ai-analyze') {
-                <!-- Detection sensitivity (analysisGranularity 1..5) -->
-                <div class="opt-block">
-                  <div class="opt-row">
-                    <span class="opt-label">Detection sensitivity</span>
-                    <span class="opt-value">{{ granularityLabel() }}</span>
-                  </div>
-                  <input
-                    type="range"
-                    class="opt-slider"
-                    min="1"
-                    max="5"
-                    step="1"
-                    [disabled]="granularityLoading()"
-                    [value]="granularityValue()"
-                    (input)="onGranularityInput($event)"
-                    aria-label="Detection sensitivity, 1 strong matches only to 5 flag everything plausible" />
-                  <span class="opt-hint">{{ granularityDescription() }}</span>
-                  @if (granularityError()) {
-                    <div class="opt-error">
-                      Couldn't load your saved sensitivity
-                      <button type="button" class="retry-link" (click)="loadDefaultGranularity()">Retry</button>
-                    </div>
-                  }
-                </div>
 
                 <!-- Custom instructions + history -->
                 <div class="opt-block">

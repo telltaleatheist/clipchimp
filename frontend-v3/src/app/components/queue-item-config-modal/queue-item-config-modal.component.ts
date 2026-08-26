@@ -101,7 +101,6 @@ export class QueueItemConfigModalComponent implements OnInit, OnDestroy {
   ngOnInit() {
     this.loadAIModels();
     this.loadInstructionsHistory();
-    this.loadDefaultGranularity();
 
     // Subscribe to model changes from other components (e.g., AI wizard)
     this.modelsChangedSub = this.aiSetupService.modelsChanged$.subscribe(() => {
@@ -139,21 +138,12 @@ export class QueueItemConfigModalComponent implements OnInit, OnDestroy {
     return text.substring(0, maxLength) + '...';
   }
 
-  getGranularityLabel(value: number): string {
-    if (value <= 1) return 'Strong matches only';
-    if (value === 2) return 'Balanced';
-    if (value === 3) return 'Aggressive';
-    if (value === 4) return 'Very aggressive';
-    return 'Flag everything plausible';
-  }
-
-  getGranularityDescription(value: number): string {
-    if (value <= 1) return 'Only explicit, unmistakable matches. Fewest false positives.';
-    if (value === 2) return 'Clear matches plus reasonably likely ones.';
-    if (value === 3) return 'Everything that could match, including implication and coded language. Expect more to review.';
-    if (value === 4) return 'Adds partial and implied matches on top of that. Expect a lot more to review, and a slower analysis.';
-    return 'Anything a passage could plausibly be. The most to review, and the slowest analysis.';
-  }
+  // THE DETECTION-SENSITIVITY SLIDER USED TO BE HERE, AND IS GONE ON PURPOSE.
+  // See process-config.component.ts for the full note: the analysis now captures
+  // everything and stores every verdict, the dial became a display filter in the
+  // video editor, and the operator removed the run-side control outright. This
+  // modal no longer sets `analysisGranularity`; the stored `defaultGranularity`
+  // is config-file-only and read only by the discovery fallback flag path.
 
   getAudioLevelDescription(level: number): string {
     if (level <= -22) return 'Very quiet - suitable for background music or ambient content';
@@ -161,36 +151,6 @@ export class QueueItemConfigModalComponent implements OnInit, OnDestroy {
     if (level <= -17) return 'Moderate - good for podcasts and general web content';
     if (level <= -15) return 'Standard - typical for YouTube and streaming platforms';
     return 'Loud - maximizes perceived volume, may reduce dynamic range';
-  }
-
-  // Default granularity value (loaded from backend)
-  private defaultGranularity = 5;
-
-  private async loadDefaultGranularity() {
-    try {
-      const response = await firstValueFrom(this.libraryService.getDefaultGranularity());
-      if (response.success) {
-        this.defaultGranularity = response.granularity;
-        console.log('Loaded default granularity:', response.granularity);
-      }
-    } catch (error) {
-      console.warn('Failed to load default granularity:', error);
-    }
-  }
-
-  onGranularityChange(value: number) {
-    // Auto-save granularity when it changes
-    this.libraryService.saveDefaultGranularity(value).subscribe({
-      next: (response) => {
-        if (response.success) {
-          this.defaultGranularity = response.granularity;
-          console.log('Saved default granularity:', response.granularity);
-        }
-      },
-      error: (error) => {
-        console.error('Failed to save default granularity:', error);
-      }
-    });
   }
 
   /**
@@ -510,9 +470,11 @@ export class QueueItemConfigModalComponent implements OnInit, OnDestroy {
       case 'transcribe':
         return { model: 'base', language: 'en', translate: false } as TranscribeConfig;
       case 'ai-analyze':
+        // No analysisGranularity: nothing in the UI sets it any more, and
+        // seeding one here would override the config-file `defaultGranularity`
+        // that the discovery fallback path still reads.
         return {
           aiModel: this.preferredSeedModel(),
-          analysisGranularity: this.defaultGranularity,
         } as AIAnalyzeConfig;
       case 'fix-aspect-ratio':
         return { targetRatio: '16:9', cropMode: 'smart' } as FixAspectRatioConfig;

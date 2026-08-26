@@ -205,30 +205,6 @@
                   </button>
                 </div>
 
-                <!-- Analysis Granularity Slider -->
-                <div class="form-group granularity-group">
-                  <div class="label-row">
-                    <label>Detection Sensitivity</label>
-                    <span class="granularity-value">{{ getGranularityLabel() }}</span>
-                  </div>
-                  <div class="slider-container">
-                    <span class="slider-label-left">Strong only</span>
-                    <input
-                      type="range"
-                      min="1"
-                      max="5"
-                      step="1"
-                      [(ngModel)]="settings.analysisGranularity"
-                      (change)="onGranularityChange()"
-                      class="granularity-slider"
-                    />
-                    <span class="slider-label-right">Flag everything</span>
-                  </div>
-                  <div class="granularity-description">
-                    {{ getGranularityDescription() }}
-                  </div>
-                </div>
-
                 <!-- Custom Instructions Info Box -->
                 <div class="info-box">
                   <div class="info-icon">💡</div>

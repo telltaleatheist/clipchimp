@@ -611,7 +611,9 @@ export class LibraryService {
             aiModel,
             aiProvider,
             customInstructions: config?.customInstructions || '',
-            analysisGranularity: config?.analysisGranularity ?? 2,
+            // Forwarded ONLY when a caller explicitly set it — see queue.service's
+            // copy of this comment. Nothing in the UI sets it any more.
+            analysisGranularity: config?.analysisGranularity,
             analysisQuality: config?.analysisQuality || 'fast'
           }
         }];
@@ -1254,26 +1256,19 @@ export class LibraryService {
     );
   }
 
-  /**
-   * Get default analysis granularity setting
-   * GET /api/config/default-granularity
+  /*
+   * getDefaultGranularity / saveDefaultGranularity USED TO LIVE HERE and were
+   * removed when the sensitivity slider came out of the three run-config
+   * surfaces (operator, 2026-08-25: "not sure we need the 1-5 run slider anymore
+   * after we've turned it into a filter").
+   *
+   * `defaultGranularity` still exists in app-config.json and the backend still
+   * exposes GET/POST /config/default-granularity, because the DISCOVERY fallback
+   * flag path still reads it as a real run input. It is now a config-file-only
+   * setting with no UI in front of it. The flag filter that replaced the slider
+   * is a display control and persists its own position locally — see
+   * models/flag-filter.ts.
    */
-  getDefaultGranularity(): Observable<{ success: boolean; granularity: number }> {
-    return this.http.get<{ success: boolean; granularity: number }>(
-      `${this.API_BASE}/config/default-granularity`
-    );
-  }
-
-  /**
-   * Save default analysis granularity setting
-   * POST /api/config/default-granularity
-   */
-  saveDefaultGranularity(granularity: number): Observable<{ success: boolean; message: string; granularity: number }> {
-    return this.http.post<{ success: boolean; message: string; granularity: number }>(
-      `${this.API_BASE}/config/default-granularity`,
-      { granularity }
-    );
-  }
 
   // =====================================================
   // CUSTOM INSTRUCTIONS HISTORY

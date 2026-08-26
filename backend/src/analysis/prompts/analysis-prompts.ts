@@ -265,6 +265,17 @@ export function normalizeSensitivity(value: number | undefined | null): 1 | 2 | 
  *   5 - flag everything plausible: the quote earns a flag unless it clearly is
  *       not an instance of the category, or the speaker is clearly opposing or
  *       reporting it. Uncertainty resolves toward flagging.
+ *
+ * THIS IS THE ONLY PLACE THE DIAL IS STILL A RUN INPUT, and the asymmetry is
+ * deliberate (operator ruling, 2026-08-25). The DEFAULT ranked path captures at
+ * its widest once and stores every verdict, so its dial moved to the display
+ * side — see FLAG_VERIFICATION_PROMPT_VERSION below. This DISCOVERY path cannot
+ * do that: it asks one open-ended question per chapter, gets back whatever list
+ * the model chose to produce, and there is no per-candidate score and no
+ * rejected-candidate list to filter afterwards. The only lever it has is the
+ * instruction it sends, so it keeps the instruction and keeps reading the stored
+ * setting. A user on a machine with no NLI worker environment therefore still
+ * changes what a run DOES when they move the control.
  */
 function getSensitivityLine(sensitivity: number): string {
   switch (normalizeSensitivity(sensitivity)) {
@@ -399,62 +410,75 @@ ${chapterText}`;
 }
 
 /**
- * The sensitivity dial, applied to the VERIFIER as one extra sentence.
+ * PROMPT IDENTITY for the flag verifier — the version stamp that invalidates the
+ * stored-verdict cache.
  *
- * The ranker's half of the dial is a threshold (0.9 / 0.7 / 0.5 / 0.35 / 0.2)
- * that decides which passages get asked about at all. That decides what is
- * ASKED; it says nothing about how strictly the answer is judged, and until now
- * the verifier asked with identical strictness at every setting — so turning the
- * dial up bought a longer candidate list answered by the same hard grader. This
- * is the dial's second half: what the verifier does with a passage that
- * plausibly, but not unmistakably, asserts the claim.
+ * Verdicts are cached in the library database keyed by, among other things, a
+ * hash of THIS string (see FlagVerdictCache in database.service.ts). The cache
+ * is keyed on the QUESTION, and the prompt template is half the question: the
+ * same passage and the same claim put to a differently-worded grader is a
+ * different question and must not reuse the old answer.
  *
- * THE VERIFIER IS NEVER BYPASSED. Every level, including 5, asks the same
- * question about every candidate; the clause below only changes where the
- * answer leans. Levels 4 and 5 lean progressively harder toward "flag", which
- * is what "flagging things left and right" means here — a much longer candidate
- * list from the ranker, still judged one passage at a time.
+ * BUMP THIS whenever `buildFlagVerificationPrompt` below changes a single
+ * character of what the model reads — wording, ordering, the JSON instruction,
+ * anything. Forgetting to bump it is the one failure mode of the cache that is
+ * silent: every stale verdict is served as if it had been asked of the new
+ * prompt.
  *
- * Sensitivity 2 adds NOTHING. It is the measured configuration (10/10 recall on
- * the hand audit, 0 extras) and every word added to a prompt moves a model, so
- * the calibrated setting keeps the calibrated prompt. 1 and 3 are byte-identical
- * to what they were before the scale was widened, for the same reason.
+ * Do NOT bump it for changes that do not reach the model (comments, types,
+ * logging), or every user pays a full re-verify for nothing.
  *
- * THE REPORT-VS-ASSERT GUARD SURVIVES EVERY LEVEL. It is the #1 correctness axis
- * for this use case — the operator's own counter-apologetics commentary must
- * never flag itself for quoting the thing it criticizes — so even the level-5
- * clause, which resolves genuine uncertainty toward "flag", keeps "clearly
- * opposing the claim or reporting that other people make it" as an explicit
- * reason to answer "skip". MEASURED on the 27b: at sensitivity 5 the reference
- * passage at 03:12 of the political video ("The president and Republicans have
- * been very eager to paint the entire Democratic party as communists and
- * Marxists") still verifies as "skip" on BOTH categories it fires
- * (political-demonization and hate) and lands in no stored section, exactly as
- * it does at sensitivity 2.
- *
- * Every clause is a POSITIVE instruction per the hygiene ruling in
- * docs/youtube-metadata-spec.md §6.1 — they say which verdict to reach for, not
- * which mistake to avoid, and none carries an example.
+ * v3 (2026-08-25) — the sensitivity ladder was removed from this prompt; every
+ * candidate is now asked the calibrated question that sensitivity 2 asked. See
+ * the retirement note below.
  */
-const VERIFICATION_EMPHASIS: Record<1 | 2 | 3 | 4 | 5, string> = {
-  1: 'Reserve "flag" for passages where the speaker states the claim outright as their own position.',
-  2: '',
-  3:
-    'A person reviews every flag before it is used, and a passage that is not flagged is never reviewed. ' +
-    'When the passage plausibly asserts the claim, answer "flag".',
-  4:
-    'A person reviews every flag before it is used, and a passage that is not flagged is never reviewed, ' +
-    'so a missed passage is the expensive error and an extra one costs a moment of review. ' +
-    'Answer "flag" when the passage plausibly matches the claim, including a partial match and a match ' +
-    'carried by implication rather than stated outright.',
-  5:
-    'A person reviews every flag before it is used, and a passage that is not flagged is never reviewed, ' +
-    'so a missed passage is the expensive error and an extra one costs a moment of review. ' +
-    'Answer "flag" whenever the passage could be an instance of the claim, in whole or in part, stated ' +
-    'outright or carried by implication. Reserve "skip" for passages that clearly do not match the claim ' +
-    'and for passages where the speaker is clearly opposing the claim or reporting that other people make ' +
-    'it. When you are genuinely uncertain, answer "flag".',
-};
+export const FLAG_VERIFICATION_PROMPT_VERSION = 'flag-verify/v3-calibrated-2026-08-25';
+
+/**
+ * THE VERIFICATION EMPHASIS LADDER IS RETIRED (operator ruling, 2026-08-25).
+ *
+ * WHAT IT WAS. `VERIFICATION_EMPHASIS` was a Record<1|2|3|4|5, string> appended
+ * to the verifier's prompt: nothing at sensitivity 2 (the calibrated
+ * configuration), a "reserve flag for outright statements" clause at 1, and
+ * progressively harder leans toward "flag" at 3, 4 and 5. It was the dial's
+ * second half — the ranker's threshold decided WHAT WAS ASKED, and this decided
+ * how the answer leaned.
+ *
+ * WHY IT IS GONE. The pipeline now captures at its widest ONCE (threshold 0.2,
+ * rescue floor 0.15 — see nli-ranker.service.ts) and stores EVERY verdict,
+ * flag and skip, with the window's score. The dial became a display filter over
+ * stored verdicts, applied client-side with no re-run. In that world a leaning
+ * clause is not a dial, it is a bias: it would bake ONE run's lean into the
+ * stored record that every later filter position reads. A verdict that says
+ * "flag, because that run was told to lean toward flag" cannot be un-leaned by
+ * a STRICT filter afterwards, and a verdict that says "skip, because that run
+ * was told to reserve flag for outright statements" is a finding LOOSE can
+ * never recover.
+ *
+ * So there is exactly one grader now, and it is the measured one: the empty
+ * emphasis that sensitivity 2 used, which scored 10/10 on the hand audit of the
+ * 12-minute reference video with 0 extras. Every candidate, at every capture
+ * depth, is asked that same question. What the user's dial moves is which of the
+ * stored answers are shown.
+ *
+ * THE REPORT-VS-ASSERT GUARD IS UNAFFECTED and stays exactly where it was, in
+ * the prompt body below. It is the #1 correctness axis for this
+ * counter-apologetics use case — the operator's own commentary must never flag
+ * itself for quoting the thing it criticizes. MEASURED, and still the crux case:
+ * the passage at 03:12 of the political reference video ("The president and
+ * Republicans have been very eager to paint the entire Democratic party as
+ * communists and Marxists") verifies as "skip" on both categories it fires. It
+ * is now STORED as that skip rather than discarded, and shows up ghosted at the
+ * LOOSE filter position with the verifier's reason attached.
+ *
+ * THE DISCOVERY FALLBACK KEEPS ITS OWN DIAL. `getSensitivityLine` above is still
+ * live and still reads the stored setting, because the discovery path (no NLI
+ * worker environment, or BRIEFCASE_FLAGS_DISCOVERY=1) asks one open-ended
+ * question per chapter and cannot capture wide and re-filter afterwards: there
+ * is no per-candidate score to filter on and no verdict list to keep. On that
+ * path the dial is still a run input and still means something. The asymmetry is
+ * deliberate and is documented at both ends.
+ */
 
 /**
  * Verify ONE (window, category) pair: does this PASSAGE contain the speaker
@@ -491,9 +515,7 @@ export function buildFlagVerificationPrompt(
   passage: string[],
   categoryName: string,
   stanceProposition: string,
-  sensitivity?: number,
 ): string {
-  const emphasis = VERIFICATION_EMPHASIS[normalizeSensitivity(sensitivity)];
   return `Transcript passage.
 
 ${passage.join('\n')}
@@ -503,7 +525,7 @@ CLAIM (${categoryName}): ${stanceProposition}
 Question: anywhere in this passage, is the speaker asserting or promoting that claim as their own position?
 Answer "flag" if the speaker asserts it, endorses it, or repeats it approvingly as true.
 Answer "skip" if the speaker is reporting that other people make that claim, quoting it neutrally, asking about it, arguing against it, or if the passage does not make that claim at all.
-${emphasis ? `${emphasis}\n` : ''}
+
 Respond with JSON only: {"verdict":"flag"} or {"verdict":"skip"}`;
 }
 

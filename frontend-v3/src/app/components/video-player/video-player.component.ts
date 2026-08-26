@@ -25,6 +25,13 @@ import {
   EditorTab,
   createEditorTab
 } from '../../models/video-editor.model';
+import {
+  FlagFilter,
+  FLAG_FILTERS,
+  loadFlagFilter,
+  passesFlagFilter,
+  saveFlagFilter,
+} from '../../models/flag-filter';
 import { TranscriptionSegment } from '../../models/video-info.model';
 
 // Sub-components
@@ -564,6 +571,22 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
   // Category filters
   categoryFilters = signal<CategoryFilter[]>([]);
 
+  /**
+   * THE FLAG FILTER — display-side, client-side, instant.
+   *
+   * The analysis captures everything and stores every verdict, so moving this
+   * re-filters an array already in memory: no HTTP call, no re-run, nothing
+   * recomputed on the backend, and nothing lost by moving it back. See
+   * models/flag-filter.ts for the ruling and the thresholds.
+   *
+   * Its position is a VIEW PREFERENCE and lives with the filter — there is no
+   * run-config control feeding it any more. It is read from localStorage on
+   * construction and written back on every change, defaulting to MODERATE, the
+   * calibrated position. See models/flag-filter.ts.
+   */
+  flagFilter = signal<FlagFilter>(loadFlagFilter());
+  readonly flagFilterPositions = FLAG_FILTERS;
+
   // Analysis data
   analysisData = signal<AnalysisData | undefined>(undefined);
 
@@ -621,20 +644,50 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
     return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   });
 
-  // Filtered sections based on category filters
+  /**
+   * The one list both the section panel and the timeline marker layer render.
+   *
+   * TWO INDEPENDENT FILTERS, applied in this order:
+   *   1. the per-category chips (which kinds of finding am I looking at);
+   *   2. the flag filter (how strong a finding has to be to be shown, and
+   *      whether the verifier's rejections are shown ghosted).
+   *
+   * Ghosted rows are NOT removed here. At LOOSE they pass the filter and travel
+   * down to the renderers, which style them from `verdict` — hiding them would
+   * defeat the point of the position.
+   */
   filteredSections = computed(() => {
     const filters = this.categoryFilters();
+    const flagFilter = this.flagFilter();
     const allSections = this.sections();
 
-    if (filters.length === 0) return allSections;
+    const byFlagFilter = allSections.filter(s => passesFlagFilter(s, flagFilter));
+    if (filters.length === 0) return byFlagFilter;
 
     const enabledCategories = new Set(
       filters.filter(f => f.enabled).map(f => f.category)
     );
 
-    return allSections.filter(s =>
+    return byFlagFilter.filter(s =>
       enabledCategories.has(s.category.toLowerCase())
     );
+  });
+
+  /**
+   * Per-position counts for the filter control, computed over the CATEGORY-
+   * filtered set so the numbers on the control match what pressing it produces.
+   */
+  flagFilterCounts = computed(() => {
+    const filters = this.categoryFilters();
+    const enabled = new Set(filters.filter(f => f.enabled).map(f => f.category));
+    const scoped = filters.length === 0
+      ? this.sections()
+      : this.sections().filter(s => enabled.has(s.category.toLowerCase()));
+    return {
+      strict: scoped.filter(s => passesFlagFilter(s, 'strict')).length,
+      moderate: scoped.filter(s => passesFlagFilter(s, 'moderate')).length,
+      loose: scoped.length,
+    };
   });
 
   // Sidebar visibility
@@ -704,6 +757,7 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
   ngOnInit() {
     // Hide the side navigation when entering the editor
     this.navService.hideNav();
+
 
     // Add wheel listener with passive: false to allow preventDefault
     window.addEventListener('wheel', this.wheelHandler, { passive: false });
@@ -1250,7 +1304,12 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
       endTime: section.end_seconds || section.start_seconds + 10,
       category: section.category || 'marker',
       description: section.description || section.title || '',
-      color: CATEGORY_COLORS[section.category?.toLowerCase()] || CATEGORY_COLORS['default']
+      color: CATEGORY_COLORS[section.category?.toLowerCase()] || CATEGORY_COLORS['default'],
+      // NULL on legacy rows, custom markers and discovery-path flags. The
+      // filter reads NULL as "an accepted flag with no score", so those render
+      // exactly as they always have — see models/flag-filter.ts.
+      verdict: section.verdict ?? null,
+      nliScore: typeof section.nli_score === 'number' ? section.nli_score : null
     }));
 
     this.sections.set(timelineSections);
@@ -1264,7 +1323,11 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
       endTime: section.end_seconds || section.start_seconds + 10,
       category: section.category || 'unknown',
       description: section.description || section.content || '',
-      color: CATEGORY_COLORS[section.category?.toLowerCase()] || CATEGORY_COLORS['default']
+      color: CATEGORY_COLORS[section.category?.toLowerCase()] || CATEGORY_COLORS['default'],
+      // See processSectionsOnly: NULL means legacy/discovery and passes every
+      // filter position.
+      verdict: section.verdict ?? null,
+      nliScore: typeof section.nli_score === 'number' ? section.nli_score : null
     }));
 
     this.sections.set(timelineSections);
@@ -2283,6 +2346,16 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
   // Delete section from analysis panel
   onSectionDeleteFromPanel(sectionId: string) {
     this.onMarkerDelete(sectionId);
+  }
+
+  /**
+   * Move the flag filter. Purely local: `filteredSections` is a computed over
+   * this signal, so the section list and the timeline both re-render on the next
+   * change-detection pass with no work done anywhere else.
+   */
+  onFlagFilterChange(filter: FlagFilter) {
+    this.flagFilter.set(filter);
+    saveFlagFilter(filter);
   }
 
   // Category filter toggle

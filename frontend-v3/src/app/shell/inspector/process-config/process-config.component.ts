@@ -76,15 +76,14 @@ export class ProcessConfigComponent {
    * Per-job mode. When non-null, this panel edits ONE already-staged job's
    * pipeline rather than composing a fresh one: enabled steps + configs are
    * seeded from these steps (merged over defaults), and every global side
-   * effect (sticky persistence, default-granularity POST, enableSteps channel)
-   * is suppressed so editing one pending job never mutates shared defaults.
+   * effect (sticky persistence, enableSteps channel) is suppressed so editing
+   * one pending job never mutates shared defaults.
    * Null = the normal compose mode (library selection).
    */
   initialSteps = input<PipelineStep[] | null>(null);
   /**
    * Whether toggles/option changes persist to the sticky last-used state and
-   * global defaults. False in per-job mode. Also gates the granularity slider's
-   * "save as default" POST and submit's rememberSteps().
+   * global defaults. False in per-job mode. Also gates submit's rememberSteps().
    */
   persistSticky = input(true);
   /** Submit button label. "Add to Queue" (compose) vs "Save to N pending". */
@@ -325,7 +324,7 @@ export class ProcessConfigComponent {
     return !models.some(m => m.id === current);
   });
 
-  // ── AI analyze options: sensitivity, custom instructions, model picker ─────
+  // ── AI analyze options: custom instructions, model picker ─────────────────
   // Loaded lazily (once) when the analyze step is enabled and AI is ready.
 
   private aiDataLoaded = false;
@@ -333,77 +332,25 @@ export class ProcessConfigComponent {
   private ensureAiData(): void {
     if (this.aiDataLoaded) return;
     this.aiDataLoaded = true;
-    // In per-job mode the granularity is already seeded from the job; loading
-    // the global default here would clobber that real value, so skip it.
-    if (this.persistSticky()) {
-      void this.loadDefaultGranularity();
-    }
     void this.loadAiModels();
     void this.loadInstructionsHistory();
   }
 
-  // Detection sensitivity (analysisGranularity, 1..5) -------------------------
-
-  granularityLoading = signal(false);
-  granularityError = signal(false);
-
-  // Mirrors normalizeSensitivity in the backend's analysis-prompts.ts, and must
-  // stay in step with it. Only a value of 6 or more is unambiguously from the
-  // old 1-10 dial, so only those are folded; 4 and 5 are read as the new scale.
-  granularityValue = computed(() => {
-    const raw = Number(this.config('ai-analyze')['analysisGranularity'] ?? 2);
-    if (!Number.isFinite(raw)) return 2;
-    if (raw > 5) return raw <= 7 ? 2 : 3;
-    return Math.min(5, Math.max(1, Math.round(raw)));
-  });
-  granularityLabel = computed(() => this.getGranularityLabel(this.granularityValue()));
-  granularityDescription = computed(() => this.getGranularityDescription(this.granularityValue()));
-
-  getGranularityLabel(value: number): string {
-    if (value <= 1) return 'Strong matches only';
-    if (value === 2) return 'Balanced';
-    if (value === 3) return 'Aggressive';
-    if (value === 4) return 'Very aggressive';
-    return 'Flag everything plausible';
-  }
-
-  getGranularityDescription(value: number): string {
-    if (value <= 1) return 'Only explicit, unmistakable matches. Fewest false positives.';
-    if (value === 2) return 'Clear matches plus reasonably likely ones.';
-    if (value === 3) return 'Everything that could match, including implication and coded language. Expect more to review.';
-    if (value === 4) return 'Adds partial and implied matches on top of that. Expect a lot more to review, and a slower analysis.';
-    return 'Anything a passage could plausibly be. The most to review, and the slowest analysis.';
-  }
-
-  /** Load the saved default sensitivity (surfaced with retry — never silent). */
-  async loadDefaultGranularity(): Promise<void> {
-    this.granularityLoading.set(true);
-    this.granularityError.set(false);
-    try {
-      const response = await firstValueFrom(this.library.getDefaultGranularity());
-      if (response.success) {
-        this.setOption('ai-analyze', 'analysisGranularity', response.granularity);
-      }
-    } catch {
-      this.granularityError.set(true);
-    } finally {
-      this.granularityLoading.set(false);
-    }
-  }
-
-  onGranularityInput(event: Event): void {
-    const value = Number((event.target as HTMLInputElement).value);
-    this.setOption('ai-analyze', 'analysisGranularity', value);
-    // Per-job edits must not touch the global default — only compose mode does.
-    if (!this.persistSticky()) return;
-    // Persist as the new default, exactly like the old Run Analysis modal.
-    this.library
-      .saveDefaultGranularity(value)
-      .pipe(takeUntilDestroyed(this.destroyRef))
-      .subscribe({
-        error: error => this.errorSurface.surfaceError("Couldn't save default sensitivity", error),
-      });
-  }
+  // THE DETECTION-SENSITIVITY SLIDER USED TO BE HERE, AND IS GONE ON PURPOSE.
+  //
+  // It was a 1-5 dial that changed what an analysis DID. Under the operator's
+  // 2026-08-25 ruling the analysis always captures everything and stores every
+  // verdict, and the dial became a display filter in the video editor's analysis
+  // panel. The operator then removed the run-side control outright: "not sure we
+  // need the 1-5 run slider anymore after we've turned it into a filter."
+  //
+  // So this surface no longer sets `analysisGranularity` at all — it is not sent
+  // with the job, and the field survives in the request models only as an
+  // optional one for API compatibility. The stored `defaultGranularity` in
+  // app-config.json is now config-file-only: the DISCOVERY fallback flag path
+  // (a machine with no NLI worker environment) still reads it as a real run
+  // input, because it asks one open-ended question per chapter and has no scored
+  // candidate list to filter afterwards. There is no UI in front of it anywhere.
 
   // Custom instructions + history --------------------------------------------
 

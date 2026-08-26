@@ -1397,7 +1397,11 @@ export class QueueService implements OnDestroy {
             aiModel,
             aiProvider,
             customInstructions: analyzeTask.options?.['customInstructions'],
-            analysisGranularity: analyzeTask.options?.['analysisGranularity'] ?? 2,
+            // Forwarded ONLY when a caller explicitly set it. No UI does any more
+            // (the 1-5 sensitivity slider was removed when the dial became a display
+            // filter), and defaulting to 2 here would override the config-file
+            // `defaultGranularity` that the discovery fallback path still reads.
+            analysisGranularity: analyzeTask.options?.['analysisGranularity'],
             analysisQuality: analyzeTask.options?.['analysisQuality'] || 'fast'
           }
         });

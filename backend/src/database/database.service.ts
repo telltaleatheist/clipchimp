@@ -79,6 +79,37 @@ export interface AnalysisSectionRecord {
   description: string | null;
   category: string | null;
   source: string;
+  /**
+   * The flag verifier's answer for this (passage, category): 'flag' when it
+   * judged the speaker to be asserting the claim, 'skip' when it judged them to
+   * be reporting, quoting, questioning or opposing it.
+   *
+   * NULL means LEGACY — a row written before verdicts were stored, or by the
+   * discovery fallback path, which produces no rejected candidates. Readers
+   * treat NULL as 'flag'.
+   */
+  verdict: 'flag' | 'skip' | null;
+  /**
+   * The NLI ranker's score for the category this row carries, 0-1. NULL on
+   * legacy and discovery rows; readers treat NULL as passing every filter
+   * threshold so old data renders unchanged.
+   */
+  nli_score: number | null;
+}
+
+/**
+ * One cached answer from the flag verifier, keyed by the QUESTION it answers.
+ * See the flag_verdict_cache DDL for why the key is shaped this way.
+ */
+export interface FlagVerdictCacheRecord {
+  question_hash: string;
+  category: string;
+  verifier_model: string;
+  prompt_version: string;
+  verdict: 'flag' | 'skip';
+  created_at: string;
+  last_hit_at: string | null;
+  hit_count: number;
 }
 
 export interface CustomMarkerRecord {
@@ -534,6 +565,21 @@ export class DatabaseService {
       );
 
       -- Analysis sections: Interesting moments (AI-identified)
+      --
+      -- verdict / nli_score carry the FLAG PIPELINE's full record, not just its
+      -- accepted findings. The ranked path captures every candidate at its
+      -- widest setting and asks the verifier about all of them, then stores BOTH
+      -- answers: 'flag' for a passage the verifier accepted, 'skip' for one it
+      -- rejected (reported / opposed / questioned rather than asserted).
+      -- nli_score is the ranker's score for the category the row carries, and it
+      -- is what the display filter thresholds on (STRICT >= 0.9, MODERATE >= 0.7,
+      -- LOOSE everything including the skips).
+      --
+      -- BOTH ARE NULLABLE AND NULL MEANS "LEGACY". Rows written before this
+      -- change, and rows written by the discovery fallback path (which has no
+      -- per-candidate score and no rejected-candidate list), carry NULL in both.
+      -- Every reader treats NULL verdict as 'flag' and NULL score as
+      -- "passes every threshold", so old libraries render exactly as they did.
       CREATE TABLE IF NOT EXISTS analysis_sections (
         id TEXT PRIMARY KEY,
         video_id TEXT NOT NULL,
@@ -544,7 +590,44 @@ export class DatabaseService {
         description TEXT,
         category TEXT,
         source TEXT DEFAULT 'ai',
+        verdict TEXT,
+        nli_score REAL,
         FOREIGN KEY (video_id) REFERENCES videos(id) ON DELETE CASCADE
+      );
+
+      -- Flag verdict cache: one row per QUESTION the flag verifier has answered.
+      --
+      -- The question is (passage text, category, stance proposition, verifier
+      -- model, prompt identity), hashed into question_hash. The verifier is a
+      -- deterministic grader (temperature 0, schema-constrained) asked the same
+      -- question over and over across re-runs of the same video, re-analyses
+      -- after an interrupted run, and different videos that happen to contain the
+      -- same passage. Answering it twice costs ~3s on the 27b and buys nothing.
+      --
+      -- WHY IT IS KEYED ON THE QUESTION AND NOT ON THE VIDEO. A cache keyed by
+      -- (video, window index) is invalidated by anything that shifts window
+      -- boundaries — a re-transcribe, a category toggled on, a threshold change —
+      -- which is exactly when a re-run happens. Keying on the text of the
+      -- question means only the questions that actually CHANGED are re-asked;
+      -- the ones whose passage and claim are unchanged are free. It also means
+      -- the cache survives a widened capture: the new candidates are new
+      -- questions, and every question the previous run already answered is a hit.
+      --
+      -- The model and the prompt identity are IN the key, not columns checked
+      -- afterwards, so switching verifier models or editing the prompt template
+      -- (bump FLAG_VERIFICATION_PROMPT_VERSION) produces different keys rather
+      -- than silently reusing another grader's answers. They are ALSO stored as
+      -- plain columns so a human can read the table and so a stale-model sweep is
+      -- a DELETE ... WHERE rather than a full wipe.
+      CREATE TABLE IF NOT EXISTS flag_verdict_cache (
+        question_hash TEXT PRIMARY KEY,
+        category TEXT NOT NULL,
+        verifier_model TEXT NOT NULL,
+        prompt_version TEXT NOT NULL,
+        verdict TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        last_hit_at TEXT,
+        hit_count INTEGER NOT NULL DEFAULT 0
       );
 
       -- Chapters: Topic/subject-based segments covering entire video timeline
@@ -741,6 +824,7 @@ export class DatabaseService {
       CREATE INDEX IF NOT EXISTS idx_videos_parent_id ON videos(parent_id);
       CREATE INDEX IF NOT EXISTS idx_tags_video ON tags(video_id);
       CREATE INDEX IF NOT EXISTS idx_sections_video ON analysis_sections(video_id);
+      CREATE INDEX IF NOT EXISTS idx_flag_verdict_cache_model ON flag_verdict_cache(verifier_model, prompt_version);
       CREATE INDEX IF NOT EXISTS idx_custom_markers_video ON custom_markers(video_id);
       CREATE INDEX IF NOT EXISTS idx_mute_sections_video ON mute_sections(video_id);
       CREATE INDEX IF NOT EXISTS idx_saved_links_status ON saved_links(status);
@@ -1721,6 +1805,56 @@ export class DatabaseService {
     } catch (error: any) {
       this.logger.error(`Error checking web_archives table: ${error?.message || 'Unknown error'}`);
     }
+
+    // Migration 24: Add verdict + nli_score to analysis_sections.
+    //
+    // The flag pipeline now stores EVERY verifier verdict, not only the accepted
+    // ones, so a section row has to say which it is and what the ranker scored.
+    //
+    // BOTH COLUMNS ARE DELIBERATELY LEFT NULL FOR EXISTING ROWS — no backfill,
+    // no DEFAULT. A legacy row was written by a pipeline that only ever stored
+    // accepted findings, so its verdict IS 'flag'; but writing that in would be
+    // asserting a score it never had, and every reader already reads NULL as
+    // "legacy: treat as flag, passes every filter". Backfilling would buy
+    // nothing and would make it impossible to tell a real 'flag' verdict from an
+    // inferred one. Migration 4 above is the pattern this follows: probe the
+    // column with a SELECT, ALTER on 'no such column'.
+    for (const column of ['verdict TEXT', 'nli_score REAL']) {
+      const name = column.split(' ')[0];
+      try {
+        db.exec(`SELECT ${name} FROM analysis_sections LIMIT 1`);
+      } catch (error: any) {
+        if (error?.message && error.message.includes(`no such column: ${name}`)) {
+          this.logger.log(`Running migration: Adding ${name} column to analysis_sections table`);
+          try {
+            db.exec(`ALTER TABLE analysis_sections ADD COLUMN ${column};`);
+            this.saveDatabase();
+            this.logger.log(`Migration complete: ${name} column added to analysis_sections`);
+          } catch (migrationError: any) {
+            // Fallback audit #6: a half-migrated schema corrupts every later
+            // write to the missing column. Abort the library load loudly —
+            // the log line above names the migration that failed.
+            throw new Error(
+              `Library database migration failed: ${migrationError?.message || 'Unknown error'}. ` +
+              `Loading was aborted because continuing with an out-of-date schema would corrupt data. ` +
+              `Check that the library volume is mounted and writable, then reopen the library.`,
+            );
+          }
+        } else {
+          // 'no such table' on a brand-new database, which initializeSchema has
+          // already created with both columns present. Anything else propagates.
+          if (!error?.message || !error.message.includes('no such table')) throw error;
+        }
+      }
+    }
+
+    // Migration 25: Create flag_verdict_cache.
+    //
+    // No probe/ALTER pair here because there is nothing to migrate: the table is
+    // created unconditionally by initializeSchema's CREATE TABLE IF NOT EXISTS,
+    // which runs on every open, so an existing library picks it up empty on the
+    // next load. This comment exists so the next person looking for "where does
+    // flag_verdict_cache get created for old libraries" stops here.
 
     // Migration: Create transcripts_soundex_fts FTS5 table for phonetic search
     try {
@@ -3791,13 +3925,22 @@ export class DatabaseService {
     description?: string;
     category?: string;
     source?: string;
+    /**
+     * The verifier's verdict for this row. OMITTED means legacy/discovery — the
+     * column is written NULL and every reader treats it as 'flag'. Callers on
+     * the ranked path always pass one, including 'skip'.
+     */
+    verdict?: 'flag' | 'skip';
+    /** The ranker's score for this row's category. Omitted on paths with no score. */
+    nliScore?: number;
   }) {
     const db = this.ensureInitialized();
 
     db.prepare(
       `INSERT INTO analysis_sections (
-        id, video_id, start_seconds, end_seconds, timestamp_text, title, description, category, source
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        id, video_id, start_seconds, end_seconds, timestamp_text, title, description, category, source,
+        verdict, nli_score
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       section.id,
       section.videoId,
@@ -3808,9 +3951,95 @@ export class DatabaseService {
       section.description || null,
       section.category || null,
       section.source || 'ai',
+      section.verdict ?? null,
+      typeof section.nliScore === 'number' && Number.isFinite(section.nliScore)
+        ? section.nliScore
+        : null,
     );
 
     this.saveDatabase();
+  }
+
+  // ---------------------------------------------------------------- flag verdict cache
+
+  /**
+   * Look up a previously answered verification question. Returns null on a miss
+   * and on any error — the cache is an optimization and must never be able to
+   * take an analysis down, so a broken or missing table degrades to "ask the
+   * model", which is exactly the behavior before the cache existed.
+   */
+  getFlagVerdict(questionHash: string): FlagVerdictCacheRecord | null {
+    try {
+      const db = this.ensureInitialized();
+      const row = db
+        .prepare('SELECT * FROM flag_verdict_cache WHERE question_hash = ?')
+        .get(questionHash) as FlagVerdictCacheRecord | undefined;
+      return row || null;
+    } catch (error: any) {
+      this.logger.debug(`Flag verdict cache lookup failed: ${error?.message || 'unknown error'}`);
+      return null;
+    }
+  }
+
+  /**
+   * Record an answer. INSERT OR REPLACE, because the only way the same hash is
+   * written twice with a different verdict is a non-deterministic grader, and in
+   * that case the newest answer is the one to keep.
+   *
+   * Deliberately does NOT call saveDatabase(): a flag run writes hundreds of
+   * these and the cache is disposable. The rows are committed by better-sqlite3
+   * the moment they are written; saveDatabase() is the library's own bookkeeping
+   * hook and running it per verdict would cost more than the cache saves.
+   */
+  putFlagVerdict(entry: {
+    questionHash: string;
+    category: string;
+    verifierModel: string;
+    promptVersion: string;
+    verdict: 'flag' | 'skip';
+  }): void {
+    try {
+      const db = this.ensureInitialized();
+      db.prepare(
+        `INSERT OR REPLACE INTO flag_verdict_cache (
+          question_hash, category, verifier_model, prompt_version, verdict, created_at, last_hit_at, hit_count
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, 0)`
+      ).run(
+        entry.questionHash,
+        entry.category,
+        entry.verifierModel,
+        entry.promptVersion,
+        entry.verdict,
+        new Date().toISOString(),
+      );
+    } catch (error: any) {
+      this.logger.debug(`Flag verdict cache write failed: ${error?.message || 'unknown error'}`);
+    }
+  }
+
+  /** Count a hit, so the table itself shows which questions keep coming back. */
+  recordFlagVerdictHit(questionHash: string): void {
+    try {
+      const db = this.ensureInitialized();
+      db.prepare(
+        'UPDATE flag_verdict_cache SET hit_count = hit_count + 1, last_hit_at = ? WHERE question_hash = ?'
+      ).run(new Date().toISOString(), questionHash);
+    } catch (error: any) {
+      this.logger.debug(`Flag verdict cache hit bump failed: ${error?.message || 'unknown error'}`);
+    }
+  }
+
+  /** Row count, for logging a run's cache state. Returns 0 when unavailable. */
+  countFlagVerdicts(): number {
+    try {
+      const db = this.ensureInitialized();
+      const row = db.prepare('SELECT COUNT(*) as count FROM flag_verdict_cache').get() as
+        | { count: number }
+        | undefined;
+      return row?.count ?? 0;
+    } catch {
+      return 0;
+    }
   }
 
   /**

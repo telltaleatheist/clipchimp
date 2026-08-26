@@ -342,6 +342,80 @@
   padding: 0 8px;
 }
 
+// ── Flag filter ──────────────────────────────────────────────────────────────
+// A three-position exclusive control, built on the same pill-container idiom as
+// .view-toggle so it reads as "which of these am I looking at" rather than as a
+// set of independent switches. Selected position takes the orange accent, the
+// house's canonical "this one is on" signal.
+.flag-filter {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 8px 8px;
+}
+
+.flag-filter-row {
+  display: flex;
+  background: var(--bg-secondary, #f8f9fa);
+  border: 1px solid var(--border-color, #dee2e6);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.flag-filter-btn {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary, #6c757d);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+
+  &:hover {
+    color: var(--text-primary, #212529);
+  }
+
+  &.active {
+    color: var(--text-primary, #212529);
+    background: var(--bg-card, #fff);
+    border-color: var(--primary-orange, #ff6b35);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  }
+}
+
+.flag-filter-count {
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary, #6c757d);
+  opacity: 0.8;
+}
+
+.flag-filter-hint {
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-secondary, #6c757d);
+}
+
+.section-verdict-badge {
+  margin-left: auto;
+  padding: 1px 6px;
+  font-size: 9px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary, #6c757d);
+  background: transparent;
+  border: 1px solid var(--border-color, #dee2e6);
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
 .section-item {
   display: flex;
   align-items: stretch;
@@ -366,6 +440,20 @@
     background: var(--bg-secondary, #f8f9fa);
     border-color: var(--section-color);
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+  }
+
+  // GHOSTED: a passage the verifier rejected as reported/opposed rather than
+  // asserted. Only rendered at the LOOSE position. It is dimmed and its left
+  // rail is dashed, so it reads as "considered and set aside" rather than as a
+  // finding — but it is still clickable and still seeks, because the whole point
+  // of showing it is that a human can go and check the machine's judgment.
+  &.ghosted {
+    opacity: 0.45;
+    border-left-style: dashed;
+
+    &:hover {
+      opacity: 0.75;
+    }
   }
 }
 

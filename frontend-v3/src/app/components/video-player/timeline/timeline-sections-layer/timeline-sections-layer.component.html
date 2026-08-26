@@ -3,12 +3,15 @@
     <div
       class="section-block"
       [class.selected]="selectedSection?.id === section.id"
+      [class.ghosted]="isGhostSection(section)"
       [style.left]="getSectionStyle(section).left"
       [style.width]="getSectionStyle(section).width"
       [style.backgroundColor]="getSectionStyle(section).backgroundColor"
       [style.borderColor]="getSectionStyle(section).borderColor"
       [style.display]="getSectionStyle(section).display"
-      [title]="section.category + ': ' + section.description"
+      [title]="isGhostSection(section)
+        ? section.category + ' [' + verifierRejectionLabel + ']: ' + section.description
+        : section.category + ': ' + section.description"
       (click)="onSectionClick(section, $event)"
       (mouseenter)="onSectionMouseEnter(section)"
       (mouseleave)="onSectionMouseLeave()">

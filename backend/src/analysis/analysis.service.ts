@@ -1182,6 +1182,13 @@ export class AnalysisService implements OnModuleInit {
                 description: section.description,
                 category: section.category,
                 source: 'ai',
+                // The ranked flag path stores EVERY verdict, accepted and
+                // rejected, with the ranker score behind it. Both are passed
+                // through verbatim and both are undefined on every other path
+                // (chapter sections, discovery flags), which writes NULL and is
+                // read back as "legacy: a flag that passes every filter".
+                verdict: section.verdict,
+                nliScore: section.nli_score,
               });
             }
           }

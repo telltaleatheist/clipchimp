@@ -102,6 +102,27 @@
         </div>
       }
 
+      <!-- Flag filter: strength of the findings shown.
+           Purely a display control — the analysis captured everything and stored
+           every verdict, so moving this re-filters an in-memory array. -->
+      <div class="flag-filter">
+        <div class="flag-filter-row">
+          @for (position of flagFilterPositions; track position) {
+            <button
+              type="button"
+              class="flag-filter-btn"
+              [class.active]="flagFilter === position"
+              [attr.aria-pressed]="flagFilter === position"
+              [title]="flagFilterDescription[position]"
+              (click)="onFlagFilterSelect(position)">
+              {{ flagFilterLabel[position] }}
+              <span class="flag-filter-count">{{ flagFilterCounts[position] }}</span>
+            </button>
+          }
+        </div>
+        <span class="flag-filter-hint">{{ flagFilterDescription[flagFilter] }}</span>
+      </div>
+
       <!-- Sections List (chronological) -->
       <div class="sections-list">
         @for (section of filteredSections; track section.id) {
@@ -109,12 +130,16 @@
             class="section-item"
             [class.selected]="selectedSection?.id === section.id"
             [class.follow-current]="followCursor() && section.id === currentSectionId"
+            [class.ghosted]="isGhostSection(section)"
             [style.--section-color]="section.color"
-            [title]="section.description">
+            [title]="isGhostSection(section) ? verifierRejectionLabel + ' — ' + section.description : section.description">
             <button class="section-content" (click)="onSectionClick(section)">
               <div class="section-time">
                 {{ formatTimeRange(section.startTime, section.endTime) }}
                 <span class="section-category-badge" [style.backgroundColor]="section.color">{{ section.category }}</span>
+                @if (isGhostSection(section)) {
+                  <span class="section-verdict-badge">{{ verifierRejectionLabel }}</span>
+                }
               </div>
               <div class="section-description">
                 {{ section.description }}
@@ -131,7 +156,15 @@
         @if (sections.length === 0) {
           <div class="empty-state">
             <p>No flagged sections found</p>
-            <p class="empty-hint">Press M to add a marker</p>
+            @if (flagFilter !== 'loose' && flagFilterCounts.loose > 0) {
+              <!-- The analysis DID find things; this position is hiding them.
+                   Say so, rather than letting the filter look like an empty run. -->
+              <p class="empty-hint">
+                {{ flagFilterCounts.loose }} captured at Loose — this filter is hiding them all
+              </p>
+            } @else {
+              <p class="empty-hint">Press M to add a marker</p>
+            }
           </div>
         }
       </div>

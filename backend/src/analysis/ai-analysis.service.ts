@@ -9,7 +9,7 @@
  *
  * Metadata (description, tags, title) is generated from chapter summaries.
  */
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, Optional } from '@nestjs/common';
 import { AIProviderService, AIProviderConfig } from './ai-provider.service';
 import { OllamaService } from './ollama.service';
 import { estimateNumCtx, numCtxMaxForModel, parseProviderModel, AITaskKind } from './model-utils';
@@ -24,12 +24,15 @@ import {
 import { findPhraseTimestamp } from './phrase-matcher';
 import { safeJsonParse } from './json-utils';
 import { ApiKeysService } from '../config/api-keys.service';
+import { DatabaseService } from '../database/database.service';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
   buildChapterAnalysisPrompt,
   buildFlagExtractionPrompt,
   buildFlagVerificationPrompt,
+  FLAG_VERIFICATION_PROMPT_VERSION,
   normalizeSensitivity,
   interpolatePrompt,
   HOOK_FROM_CHAPTERS_PROMPT,
@@ -71,6 +74,26 @@ export interface AnalyzedSection {
   start_time: string;
   end_time: string | null;
   quotes: Quote[];
+  /**
+   * The flag verifier's answer for this (passage, category).
+   *
+   * The ranked path emits BOTH: 'flag' for a passage the verifier accepted, and
+   * 'skip' for one it rejected as reported / quoted / questioned / opposed
+   * rather than asserted. Rejected passages are not discarded any more — they
+   * are stored and shown, ghosted, at the LOOSE filter position, because a
+   * capture-wide-then-filter pipeline that threw its rejections away could never
+   * show the user what it decided not to show them.
+   *
+   * ABSENT on the discovery fallback path and on everything that is not a flag
+   * (chapter sections, legacy rows). Absent is read as 'flag' everywhere.
+   */
+  verdict?: 'flag' | 'skip';
+  /**
+   * The NLI ranker's score, 0-1, for the category this section carries — the
+   * number the display filter thresholds on (STRICT >= 0.9, MODERATE >= 0.7).
+   * Absent wherever there is no ranker score, and absent passes every filter.
+   */
+  nli_score?: number;
 }
 
 export interface Chapter {
@@ -504,6 +527,15 @@ export class AIAnalysisService {
     private readonly apiKeysService: ApiKeysService,
     private readonly chapterDetectionService: ChapterDetectionService,
     private readonly nliRanker: NliRankerService,
+    /**
+     * OPTIONAL on purpose. This service is constructed directly by smoke
+     * harnesses and by callers that have no library open, and the only thing it
+     * uses the database for is the verdict cache — an optimization. A missing
+     * DatabaseService means every question is asked of the model, which is
+     * exactly the behavior before the cache existed. It must never be the reason
+     * an analysis cannot run.
+     */
+    @Optional() private readonly databaseService?: DatabaseService,
   ) {}
 
   /**
@@ -519,12 +551,26 @@ export class AIAnalysisService {
    * malformed config must not take the whole analysis down.
    */
   /**
-   * The stored default sensitivity (app-config `defaultGranularity`), used when
-   * a caller does not pass `analysisGranularity`. Some entry points (the
-   * standalone analysis controller path) never plumbed the option, which
-   * silently ran them at the hardcoded prompt default regardless of the user's
-   * setting — defaulting HERE honors the dial for every caller, present and
-   * future. Callers that do pass a value are unaffected.
+   * The stored default sensitivity (app-config `defaultGranularity`).
+   *
+   * THIS IS NOW A DISCOVERY-FALLBACK-ONLY SETTING, and it is the ONLY way it can
+   * be set: the 1-5 sensitivity slider was removed from all three run-config
+   * surfaces (operator, 2026-08-25: "not sure we need the 1-5 run slider anymore
+   * after we've turned it into a filter"), and nothing in the UI writes or reads
+   * it. It lives in app-config.json and is edited by hand, or not at all.
+   *
+   * The DEFAULT ranked flag path ignores sensitivity entirely — it captures at
+   * its widest, verifies everything, stores every verdict, and the dial became a
+   * display filter in the video editor. The DISCOVERY fallback path (no NLI
+   * worker environment, or BRIEFCASE_FLAGS_DISCOVERY=1) still uses it as a real
+   * run input, because it asks one open-ended question per chapter and has no
+   * scored candidate list to filter afterwards.
+   *
+   * It is resolved HERE rather than at the discovery branch because the value is
+   * also carried into the run's log line and because some entry points (the
+   * standalone analysis controller path) never plumbed the option at all. When
+   * neither the caller nor the config file supplies one, the discovery prompt's
+   * own default (2, balanced) applies — see getSensitivityLine.
    */
   private loadDefaultGranularity(): number | undefined {
     try {
@@ -745,12 +791,15 @@ export class AIAnalysisService {
       onProgress,
     } = options;
 
-    // Sensitivity: an explicit value wins; otherwise the user's stored default
-    // (see loadDefaultGranularity — some entry points never pass the option).
+    // Sensitivity, USED ONLY BY THE DISCOVERY FALLBACK FLAG PATH: an explicit
+    // value wins; otherwise the config file's stored default; otherwise the
+    // discovery prompt's own default of 2. Nothing in the UI sets either any
+    // more — see loadDefaultGranularity. The ranked path never reads this.
     const analysisGranularity = options.analysisGranularity ?? this.loadDefaultGranularity();
     if (options.analysisGranularity === undefined && analysisGranularity !== undefined) {
       this.logger.log(
-        `[Sensitivity] Caller passed none — using stored default ${analysisGranularity}`,
+        `[Sensitivity] Caller passed none — using the config file's stored default ` +
+        `${analysisGranularity} (discovery fallback path only)`,
       );
     }
 
@@ -1470,7 +1519,7 @@ export class AIAnalysisService {
   }
 
   /**
-   * Turn verified windows into stored sections — ONE section per window.
+   * Turn a window's ACCEPTED categories into ONE stored section.
    *
    * WHY ONE, when a window can have several verified categories. The operator's
    * complaint about the previous shape was over-splitting: four back-to-back
@@ -1482,11 +1531,24 @@ export class AIAnalysisService {
    * `description` is the field both section lists and the timeline tooltip
    * render, so the extra categories are on screen wherever the flag is.
    *
+   * THIS MERGE IS WHY REJECTED CATEGORIES GET THEIR OWN ROWS INSTEAD (see
+   * buildSkipSections). A 'skip' is a statement about ONE claim against ONE
+   * passage — "the speaker is reporting this, not asserting it" — and merging
+   * several of them into one row would produce a ghost marker that means nothing
+   * in particular. Accepted verdicts merge because they describe the same
+   * moment; rejected verdicts do not, because each one names a different
+   * rejected reading of it.
+   *
    * The SPAN is measured, never a fixed window: it runs from the first to the
    * last sentence that fired a VERIFIED category, and the quote is that span
    * read verbatim. Sentences that fired only a category the verifier rejected do
    * not stretch the span, and the surrounding context the model was shown is not
    * part of it — a viewer clicking the flag lands on the words that earned it.
+   *
+   * `nli_score` on the row is the PRIMARY category's ranker score, i.e. the
+   * strongest evidence in the window, because that is the number the STRICT and
+   * MODERATE filter positions are asking about: "how strong is the best reason
+   * this passage is on my timeline".
    */
   private buildWindowSections(
     verified: Array<{ window: FlagWindow; categories: WindowCategory[] }>,
@@ -1516,23 +1578,146 @@ export class AIAnalysisService {
         start_time: this.formatDisplayTime(sentences[from].start),
         end_time: this.formatDisplayTime(sentences[to].end),
         quotes: [{ timestamp: this.formatDisplayTime(sentences[from].start), text }],
+        verdict: 'flag',
+        nli_score: primary.score,
       });
     }
 
-    return sections.sort(
-      (a, b) => this.parseDisplayTime(a.start_time) - this.parseDisplayTime(b.start_time),
-    );
+    return sections;
   }
 
   /**
-   * The DEFAULT flag path: rank every sentence, group the survivors into
-   * paragraph-sized windows, then ask one question per (window, category).
+   * Turn REJECTED (window, category) verdicts into stored sections — one row
+   * each, marked 'skip'.
+   *
+   * THIS IS THE HALF OF THE PIPELINE THAT USED TO BE THROWN AWAY. Under the
+   * operator's 2026-08-25 ruling the run captures at its widest and the dial
+   * becomes a display filter, and a filter can only filter what was kept. The
+   * LOOSE position shows these rows ghosted, labelled with the verifier's reason
+   * for rejecting them, so "what did the machine decide not to show me" is a
+   * question the UI can actually answer instead of a black box.
+   *
+   * ONE ROW PER (WINDOW, CATEGORY), unlike the accepted side — see
+   * buildWindowSections for why. The span is the sentences that fired THIS
+   * category, not the whole window, so a ghost marker sits on the words that
+   * scored rather than on the paragraph they were read in.
+   *
+   * A window can produce both: a passage that flags on `hate` and skips on
+   * `conspiracy` stores one flag row and one skip row over overlapping time.
+   * That is the honest record, and the filter is what separates them.
+   *
+   * DEGRADED CALLS ARE NOT WRITTEN HERE. A call that timed out, hit the token
+   * ceiling, or came back without a readable verdict is counted and logged, and
+   * the pipeline treats it as "not flagged" exactly as before — but it is NOT a
+   * rejection, and storing it as one would put words in the verifier's mouth and
+   * caption them "the verifier rejected this". Those candidates are simply
+   * absent from the record, and the run's log says how many.
+   */
+  private buildSkipSections(
+    rejected: Array<{ window: FlagWindow; category: WindowCategory }>,
+    sentences: RankedSentence[],
+  ): AnalyzedSection[] {
+    const sections: AnalyzedSection[] = [];
+
+    for (const { window, category } of rejected) {
+      const fired =
+        category.sentenceIndices.length > 0
+          ? category.sentenceIndices
+          : [window.firedFrom, window.firedTo];
+      const from = Math.min(...fired);
+      const to = Math.max(...fired);
+      const text = sentences.slice(from, to + 1).map((sentence) => sentence.text).join(' ');
+
+      sections.push({
+        category: category.category,
+        // Same shape as a flag row's description — the quote is the content. The
+        // "verifier rejected this" caption is NOT baked in here: it is a
+        // rendering decision the UI makes from `verdict`, so it can be worded,
+        // restyled and localized without rewriting stored data.
+        description: `"${text}"`,
+        start_time: this.formatDisplayTime(sentences[from].start),
+        end_time: this.formatDisplayTime(sentences[to].end),
+        quotes: [{ timestamp: this.formatDisplayTime(sentences[from].start), text }],
+        verdict: 'skip',
+        nli_score: category.score,
+      });
+    }
+
+    return sections;
+  }
+
+  /**
+   * The stable identity of ONE verification question, for the verdict cache.
+   *
+   * EVERYTHING THE ANSWER DEPENDS ON IS IN THE HASH and nothing else is:
+   *
+   *   passage     the exact text the model reads, newline-joined as sent;
+   *   category    the label the claim is being tested under;
+   *   proposition the stance hypothesis the claim is stated as;
+   *   model       "provider:model" — a different grader is a different answer;
+   *   prompt      FLAG_VERIFICATION_PROMPT_VERSION, the template's identity.
+   *
+   * Timestamps, video id, window indices and sensitivity are deliberately OUT.
+   * They do not change the answer, and including any of them would invalidate
+   * the cache on exactly the re-runs it exists to make cheap — a re-transcribe
+   * that shifts every timestamp by 40ms, a widened capture that renumbers every
+   * window, a second video quoting the same passage.
+   *
+   * The parts are joined with a delimiter that cannot occur in any of them, so
+   * two different questions cannot collide by concatenation.
+   */
+  private verificationQuestionHash(
+    passage: string[],
+    categoryName: string,
+    proposition: string,
+    verifierModel: string,
+  ): string {
+    return crypto
+      .createHash('sha256')
+      .update(
+        [
+          FLAG_VERIFICATION_PROMPT_VERSION,
+          verifierModel,
+          categoryName,
+          proposition,
+          passage.join('\n'),
+          // U+0000 cannot appear in a prompt, a model name or a transcript,
+          // so no two different questions can collide by concatenation.
+        ].join('\u0000'),
+      )
+      .digest('hex');
+  }
+
+  /**
+   * The DEFAULT flag path: rank every sentence at the widest capture setting,
+   * group the survivors into paragraph-sized windows, ask one question per
+   * (window, category), and STORE EVERY ANSWER.
+   *
+   * WHAT CHANGED, AND THE RULING BEHIND IT (operator, 2026-08-25):
+   *
+   *   "really, we should find all the loose flags and organize them, and the
+   *    knob can be a filter afterward that filters out loosely paired ones,
+   *    moderate, or strictly paired ones... all the work will be done anyway,
+   *    and itll be a UI component that filters out loose pairings rather than
+   *    defining what the actual run does before it runs."
+   *
+   * So this stage takes NO sensitivity. It captures at 0.2 with the clamped 0.15
+   * rescue floor, asks the calibrated question (the old sensitivity-2 prompt,
+   * with the emphasis ladder retired — see FLAG_VERIFICATION_PROMPT_VERSION),
+   * and returns BOTH the accepted and the rejected verdicts as sections carrying
+   * `verdict` and `nli_score`. Which of them a user sees is decided afterwards,
+   * client-side, instantly, and reversibly.
+   *
+   * VERIFICATION ORDER IS DESCENDING WINDOW SCORE, and that is a durability
+   * property, not a cosmetic one: a run killed halfway has already answered and
+   * cached its most trustworthy questions, so the resume is cheap AND the
+   * findings that survive an interruption are the ones most worth having.
    *
    * Returns null when the ranker is unavailable or its scoring call fails, which
    * is the caller's signal to run the old chapter-discovery pass instead. It
-   * never throws for a per-call problem: a failed or unreadable
-   * verification is that (window, category) degrading to 'skip' with a warning,
-   * NOT a recordFailure — one bad HTTP call must not push a run toward
+   * never throws for a per-call problem: a failed or unreadable verification is
+   * that (window, category) degrading to "not flagged" with a warning, NOT a
+   * recordFailure — one bad HTTP call must not push a run toward
    * TOO_MANY_FAILURES when the pipeline is making hundreds of tiny calls. A
    * TOTAL failure (Ollama down, so every call throws) is reported to the caller
    * the same way chapter analysis reports total failure: the run's own
@@ -1542,7 +1727,6 @@ export class AIAnalysisService {
     flagConfig: AIProviderConfig,
     segments: Segment[],
     categories: AnalysisCategory[],
-    sensitivity: number | undefined,
     recordFailure: (what: string) => void,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
     onFlagProgress?: (current: number, total: number) => void,
@@ -1557,7 +1741,7 @@ export class AIAnalysisService {
     let windows: FlagWindow[];
     try {
       onFlagStatus?.(`Ranking ${sentences.length} sentences for flag candidates...`);
-      windows = await this.nliRanker.rankWindows(sentences, categories, sensitivity);
+      windows = await this.nliRanker.rankWindows(sentences, categories);
     } catch (error) {
       this.logger.warn(`[Pass 2b] NLI ranking failed: ${(error as Error).message}`);
       return null;
@@ -1565,29 +1749,53 @@ export class AIAnalysisService {
 
     // One call per (window, category) — a passage where three categories fired
     // costs three questions, not one per (sentence, category) pair.
-    const jobs: Array<{ window: FlagWindow; category: WindowCategory; prompt: string }> = [];
+    //
+    // `windows` arrives from rankWindows sorted by DESCENDING noisy-OR strength
+    // and each window's categories are ordered strongest-first, so walking them
+    // in nested order produces exactly the descending-score verification order
+    // this stage promises. The order is ASSERTED in the loop below rather than
+    // re-sorted here, so a change to rankWindows' ordering surfaces as a loud
+    // warning instead of being silently papered over.
+    const jobs: Array<{
+      window: FlagWindow;
+      category: WindowCategory;
+      passage: string[];
+      prompt: string;
+    }> = [];
     for (const window of windows) {
       const passage = sentences.slice(window.contextFrom, window.contextTo + 1).map((s) => s.text);
       for (const category of window.categories) {
         jobs.push({
           window,
           category,
-          prompt: buildFlagVerificationPrompt(
-            passage,
-            category.category,
-            category.proposition,
-            sensitivity,
-          ),
+          passage,
+          prompt: buildFlagVerificationPrompt(passage, category.category, category.proposition),
         });
       }
     }
 
-    const threshold = this.nliRanker.thresholdForSensitivity(sensitivity);
+    const verifierModel = `${flagConfig.provider}:${flagConfig.model}`;
     this.logger.log(
-      `[Pass 2b] Ranked ${sentences.length} sentences at threshold ${threshold} ` +
-      `(sensitivity ${normalizeSensitivity(sensitivity)}) -> ${windows.length} windows / ${jobs.length} ` +
-      `verification calls on ${flagConfig.provider}:${flagConfig.model}`,
+      `[Pass 2b] Ranked ${sentences.length} sentences at the fixed capture threshold ` +
+      `${this.nliRanker.captureThreshold} (rescue floor ${this.nliRanker.rescueFloor}) -> ` +
+      `${windows.length} windows / ${jobs.length} verification calls on ${verifierModel}. ` +
+      `Sensitivity is NOT a run input on this path: every candidate is verified and every verdict ` +
+      `is stored, and the dial filters that stored record at display time.`,
     );
+
+    // Descending-order assertion. Cheap, and it is the only thing standing
+    // between "an interrupted run keeps its best findings" and a silent
+    // regression in a sort comparator two files away.
+    for (let i = 1; i < windows.length; i++) {
+      if (windows[i].score - windows[i - 1].score > 1e-9) {
+        this.logger.warn(
+          `[Pass 2b] Verification order is NOT descending by window score at index ${i} ` +
+          `(${windows[i - 1].score.toFixed(4)} then ${windows[i].score.toFixed(4)}) — an interrupted ` +
+          `run will not have finished its most trustworthy findings first.`,
+        );
+        break;
+      }
+    }
 
     // The call count is only known NOW, so this is where the run's API-call
     // estimate gets corrected — the same mid-run recompute the chapter loop does
@@ -1617,14 +1825,56 @@ export class AIAnalysisService {
     // are walked in noisy-OR order, so a window's categories can be answered
     // consecutively but a window is only finished when all of them are.
     const verifiedByWindow = new Map<FlagWindow, WindowCategory[]>();
+    const rejected: Array<{ window: FlagWindow; category: WindowCategory }> = [];
     let flaggedCalls = 0;
     let skipped = 0;
     let degraded = 0;
+    let cacheHits = 0;
+    const cachePresent = this.databaseService?.isInitialized?.() === true;
     const startedAt = Date.now();
 
+    if (!cachePresent) {
+      this.logger.log(
+        '[Pass 2b] Verdict cache unavailable (no open library database) — every question goes to the model.',
+      );
+    }
+
     for (let i = 0; i < jobs.length; i++) {
-      const { window, category, prompt } = jobs[i];
+      const { window, category, passage, prompt } = jobs[i];
       const where = `${this.formatDisplayTime(sentences[window.firedFrom].start)} (${category.category})`;
+      const questionHash = this.verificationQuestionHash(
+        passage,
+        category.category,
+        category.proposition,
+        verifierModel,
+      );
+
+      // ---- cache lookup ----------------------------------------------------
+      // A hit skips the model entirely. It is logged at log level, individually
+      // and distinctly, because "did the cache actually work" is a question that
+      // gets asked of a run's log, and a silent optimization is an unverifiable
+      // one.
+      const cached = cachePresent ? this.databaseService!.getFlagVerdict(questionHash) : null;
+      if (cached) {
+        cacheHits++;
+        this.databaseService!.recordFlagVerdictHit(questionHash);
+        this.logger.log(
+          `[Pass 2b] CACHE HIT ${where} -> ${cached.verdict} (first asked ${cached.created_at}, ` +
+          `hit ${cached.hit_count + 1}x, q ${questionHash.slice(0, 12)}) — no model call`,
+        );
+        if (cached.verdict === 'flag') {
+          flaggedCalls++;
+          const list = verifiedByWindow.get(window);
+          if (list) list.push(category);
+          else verifiedByWindow.set(window, [category]);
+        } else {
+          skipped++;
+          rejected.push({ window, category });
+        }
+        onFlagProgress?.(i + 1, jobs.length);
+        continue;
+      }
+
       try {
         const response = await this.aiProviderService.generateText(prompt, flagConfig, 'flags', overrides);
         onTokens?.(response);
@@ -1632,38 +1882,60 @@ export class AIAnalysisService {
         if (response.doneReason === 'length') {
           degraded++;
           this.logger.warn(
-            `[Pass 2b] Verification hit the token ceiling at ${where} — skipping this category`,
+            `[Pass 2b] Verification hit the token ceiling at ${where} — not flagged, and NOT recorded ` +
+            `as a rejection`,
           );
         } else {
           const verdict = this.parseVerificationVerdict(response.text);
           if (verdict === null) {
             degraded++;
             this.logger.warn(
-              `[Pass 2b] No verdict in the verification answer at ${where} — skipping this category`,
+              `[Pass 2b] No verdict in the verification answer at ${where} — not flagged, and NOT ` +
+              `recorded as a rejection`,
             );
-          } else if (verdict === 'flag') {
-            flaggedCalls++;
-            const list = verifiedByWindow.get(window);
-            if (list) list.push(category);
-            else verifiedByWindow.set(window, [category]);
           } else {
-            skipped++;
+            // Only real verdicts are cached. A degraded call has no answer to
+            // remember, and caching "no answer" would make a transient Ollama
+            // hiccup permanent for that question.
+            if (cachePresent) {
+              this.databaseService!.putFlagVerdict({
+                questionHash,
+                category: category.category,
+                verifierModel,
+                promptVersion: FLAG_VERIFICATION_PROMPT_VERSION,
+                verdict,
+              });
+            }
+            if (verdict === 'flag') {
+              flaggedCalls++;
+              const list = verifiedByWindow.get(window);
+              if (list) list.push(category);
+              else verifiedByWindow.set(window, [category]);
+            } else {
+              skipped++;
+              rejected.push({ window, category });
+            }
           }
         }
       } catch (error) {
         degraded++;
         this.logger.warn(
-          `[Pass 2b] Verification call failed at ${where}: ${(error as Error).message} — skipping this category`,
+          `[Pass 2b] Verification call failed at ${where}: ${(error as Error).message} — not flagged, ` +
+          `and NOT recorded as a rejection`,
         );
       }
       onFlagProgress?.(i + 1, jobs.length);
     }
 
     const wallSeconds = (Date.now() - startedAt) / 1000;
+    const modelCalls = jobs.length - cacheHits;
     this.logger.log(
       `[Pass 2b] Verified ${jobs.length} (window, category) pairs across ${windows.length} windows in ` +
-      `${wallSeconds.toFixed(1)}s (${(wallSeconds / jobs.length).toFixed(2)}s/call): ` +
-      `${flaggedCalls} flag, ${skipped} skip, ${degraded} unusable`,
+      `${wallSeconds.toFixed(1)}s (${(wallSeconds / jobs.length).toFixed(2)}s/pair): ` +
+      `${flaggedCalls} flag, ${skipped} skip, ${degraded} unusable. ` +
+      `Cache: ${cacheHits}/${jobs.length} hits (${((cacheHits / jobs.length) * 100).toFixed(1)}%), ` +
+      `${modelCalls} model call(s)` +
+      (cachePresent ? `, ${this.databaseService!.countFlagVerdicts()} question(s) now cached` : ''),
     );
 
     // Every single call failing is a broken stage, not a quiet result. Report it
@@ -1682,10 +1954,20 @@ export class AIAnalysisService {
       .sort((a, b) => a.contextFrom - b.contextFrom)
       .map((window) => ({ window, categories: verifiedByWindow.get(window) as WindowCategory[] }));
 
-    const sections = this.buildWindowSections(verified, sentences);
+    const flagSections = this.buildWindowSections(verified, sentences);
+    const skipSections = this.buildSkipSections(rejected, sentences);
+    const sections = [...flagSections, ...skipSections].sort(
+      (a, b) =>
+        this.parseDisplayTime(a.start_time) - this.parseDisplayTime(b.start_time) ||
+        // Flags before ghosts at the same timestamp, so a list rendered in
+        // stored order puts the finding above the rejected readings of it.
+        (a.verdict === b.verdict ? 0 : a.verdict === 'flag' ? -1 : 1),
+    );
+
     this.logger.log(
-      `[Pass 2b] ${flaggedCalls} verified (window, category) verdicts across ${verified.length} windows ` +
-      `-> ${sections.length} flag sections`,
+      `[Pass 2b] ${flaggedCalls} accepted (window, category) verdicts across ${verified.length} windows ` +
+      `-> ${flagSections.length} flag sections; ${skipSections.length} rejected verdicts stored as ` +
+      `ghost sections (visible only at the LOOSE filter position)`,
     );
     return sections;
   }
@@ -1867,11 +2149,13 @@ export class AIAnalysisService {
           : this.nliRanker.unavailable || 'NLI ranker unavailable';
 
       if (!unavailableReason) {
+        // analysisGranularity is deliberately NOT passed. On this path the dial
+        // is a display filter over stored verdicts, not a run input — see
+        // runRankedFlagStage. The discovery branch below still reads it.
         const ranked = await this.runRankedFlagStage(
           flagConfig,
           segments,
           categories,
-          analysisGranularity,
           recordFailure,
           onTokens,
           onFlagProgress,
@@ -1879,8 +2163,10 @@ export class AIAnalysisService {
         );
         if (ranked) {
           this.logger.log(
-            `[Pass 2b] FLAG PATH: ranked + verified (NLI sentence ranking, merged into passages, one ` +
-            `verification call per (window, category)) — ${ranked.length} flag sections`,
+            `[Pass 2b] FLAG PATH: ranked + verified (NLI sentence ranking at the fixed widest capture, ` +
+            `merged into passages, one verification call per (window, category), every verdict stored) ` +
+            `— ${ranked.length} sections (${ranked.filter((r) => r.verdict !== 'skip').length} flag, ` +
+            `${ranked.filter((r) => r.verdict === 'skip').length} ghosted rejections)`,
           );
           // Returned WITHOUT the 5-second timestamp dedup below. That dedup
           // exists to clean up after a discovery model emitting several flags
@@ -1892,8 +2178,15 @@ export class AIAnalysisService {
         unavailableReason = 'NLI ranking failed mid-run';
       }
 
+      // THE DISCOVERY PATH KEEPS THE DIAL. It cannot capture wide and re-filter:
+      // it asks one open-ended question per chapter and gets back whatever list
+      // the model chose to produce, with no per-candidate score and no rejected
+      // candidates to store. `analysisGranularity` is therefore still a real run
+      // input here, and its rows are written legacy-shaped (verdict and
+      // nli_score NULL), which every reader treats as an unfiltered flag.
       this.logger.log(
-        `[Pass 2b] FLAG PATH: chapter discovery (${unavailableReason}) — ` +
+        `[Pass 2b] FLAG PATH: chapter discovery (${unavailableReason}), sensitivity ` +
+        `${normalizeSensitivity(analysisGranularity)} is a RUN INPUT on this path — ` +
         `extracting flags for ${pendingFlagWork.length} chapters on ${flagConfig.provider}:${flagConfig.model} ` +
         `(concurrency ${Math.min(FLAG_EXTRACTION_CONCURRENCY, pendingFlagWork.length)})`,
       );

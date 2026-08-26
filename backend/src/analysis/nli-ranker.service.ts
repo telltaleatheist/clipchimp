@@ -49,9 +49,10 @@
  */
 import { Injectable, Logger, OnApplicationShutdown } from '@nestjs/common';
 import { ChildProcessWithoutNullStreams, spawn } from 'child_process';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { AnalysisCategory, normalizeSensitivity } from './prompts/analysis-prompts';
+import { AnalysisCategory } from './prompts/analysis-prompts';
 
 // =============================================================================
 // TYPES
@@ -285,64 +286,51 @@ const MISINFORMATION_EXCLUSION =
   'Set BRIEFCASE_FLAGS_DISCOVERY=1 to run the LLM discovery pass, which can judge factual claims.';
 
 /**
- * Score above which a (sentence, category) pair becomes a candidate, per
- * sensitivity setting.
+ * CAPTURE_THRESHOLD — the score above which a (sentence, category) pair becomes
+ * a candidate. ONE number, for every run, unconditionally.
  *
- * THE DIAL IS NOW LITERAL. It used to be a paragraph of English appended to a
- * prompt ("be exhaustive", "when unsure, do not flag") whose effect on the
- * model was unmeasurable. Here it is the number that decides how far down the
- * ranked list the verifier reads:
+ * THE DIAL USED TO LIVE HERE AND NO LONGER DOES (operator ruling, 2026-08-25):
  *
- *   1 (strong matches only)  0.9  — near-certain entailment only.
- *   2 (balanced, default)    0.7  — the calibrated value: kept 100% of the
- *                                   non-marginal hand-audit ground truth on both
- *                                   reference videos.
- *   3 (aggressive)           0.5  — reads deeper into the list, more verifier
- *                                   calls, recall over precision. The verifier
- *                                   is also asked to lean toward "flag" at this
- *                                   setting (VERIFICATION_EMPHASIS in
- *                                   analysis-prompts.ts) — a longer candidate
- *                                   list answered by the same hard grader is
- *                                   only half a dial.
- *   4 (very aggressive)      0.35 — "flagging things left and right".
- *   5 (flag everything       0.2  — the bottom of the useful range. deberta
- *      plausible)                   scores are strongly bimodal on this
- *                                   material: below ~0.15 essentially nothing
- *                                   is a near-miss, it is the model saying no,
- *                                   so a lower threshold stops ranking and
- *                                   starts forwarding the transcript.
+ *   "really, we should find all the loose flags and organize them, and the knob
+ *    can be a filter afterward that filters out loosely paired ones, moderate,
+ *    or strictly paired ones... all the work will be done anyway, and itll be a
+ *    UI component that filters out loose pairings rather than defining what the
+ *    actual run does before it runs."
  *
- * 4 AND 5 DIFFER FROM 3 BY DEGREE, NOT BY KIND. The verifier still answers every
- * single candidate — nothing is ever flagged without a verdict, at any setting.
- * What moves is how far down the ranked list the verifier is asked to read, how
- * wide the rescue rule reaches, and how strongly the verifier is told to lean
- * toward "flag" when a passage is plausible but not unmistakable.
+ * What was here was `THRESHOLD_BY_SENSITIVITY: {1: 0.9, 2: 0.7, 3: 0.5, 4: 0.35,
+ * 5: 0.2}` — the sensitivity dial as a literal number deciding how far down the
+ * ranked list the verifier read. It is replaced by its own widest setting,
+ * always. The verifier answers every captured candidate, every verdict is
+ * stored with the score that produced it, and the dial becomes a filter over
+ * that stored record (see the flag filter in the analysis panel). A run at 0.9
+ * and a run at 0.2 no longer produce different DATA; they produce the same data
+ * shown two different ways, and the choice is made after the work, reversibly,
+ * with no re-run.
  *
- * Cost scales with this dial, because every (window, category) pair is one
- * verifier call. MEASURED on the two reference videos, 27b verifier at ~3s a
- * call, with the merged-window step in place — candidates / verify calls /
- * stored sections:
+ * WHY 0.2 IS THE BOTTOM, and not 0.0. deberta scores are strongly bimodal on
+ * this material: below ~0.15 essentially nothing is a near-miss, it is the model
+ * saying no. A lower threshold stops ranking and starts forwarding the
+ * transcript. 0.2 was the bottom of the old dial for that measured reason and it
+ * is the bottom here for the same one.
+ *
+ * WHAT WIDE CAPTURE COSTS, MEASURED on the two reference videos with the 27b
+ * verifier at ~3s a call, with the merged-window step in place — candidates /
+ * verify calls / stored FLAG sections at each of the old dial positions:
  *
  *              watters (12 min, 159 sentences)   hank (60 min, 801 sentences)
- *   s2  0.7      72 /  56 / 11                     79 /  67 / 13   (4m34s)
- *   s3  0.5      89 /  67 / 12                    107 /  90 / 19   (6m12s)
- *   s4  0.35     95 /  69 / -                     134 / 111 / 22   (7m33s)
- *   s5  0.2     119 /  83 / 16                    164 / 134 / 27   (9m13s)
+ *   0.7          72 /  56 / 11                     79 /  67 / 13   (4m34s)
+ *   0.5          89 /  67 / 12                    107 /  90 / 19   (6m12s)
+ *   0.35         95 /  69 / -                     134 / 111 / 22   (7m33s)
+ *   0.2 (this)  119 /  83 / 16                    164 / 134 / 27   (9m13s)
  *
- * The ramp is real but SUBLINEAR in the threshold, and the reason is worth
- * knowing before anyone tunes these numbers: the scores are bimodal, so dropping
- * the bar from 0.5 to 0.2 adds far fewer candidates than the interval suggests,
- * and windowing then merges many of the new ones into passages that were already
- * going to be verified. Sensitivity 5 costs roughly twice sensitivity 2 on the
- * long video, not ten times.
+ * So capturing at the widest setting costs roughly twice the old default on the
+ * long video, not ten times — the ramp is SUBLINEAR in the threshold because the
+ * scores are bimodal and because windowing merges many of the new candidates
+ * into passages that were already going to be verified. That cost is now paid
+ * ONCE, and the question-keyed verdict cache (see FlagVerdictCache) means a
+ * re-run of the same video pays almost none of it again.
  */
-const THRESHOLD_BY_SENSITIVITY: Record<1 | 2 | 3 | 4 | 5, number> = {
-  1: 0.9,
-  2: 0.7,
-  3: 0.5,
-  4: 0.35,
-  5: 0.2,
-};
+const CAPTURE_THRESHOLD = 0.2;
 
 /**
  * VERIFICATION WINDOWS — the parameters that turn hot sentences into passages.
@@ -407,17 +395,19 @@ const WINDOW_MAX_MERGED_SECONDS = 40;
  * verification calls — the opposite of what this change is for — and would let
  * a weak category attach itself to a strong sentence.
  *
- * THE MARGIN WIDENS WITH THE DIAL. 0.15 is kept byte-identical at sensitivities
- * 1-3, where it is the measured value; it widens to 0.20 at 4 and 0.25 at 5,
- * because at those settings corroboration is exactly the kind of weak-but-real
- * evidence the operator has asked to see.
+ * THE MARGIN IS THE WIDEST THE OLD DIAL EVER USED. It was a per-sensitivity
+ * record (0.15 at 1-3, 0.20 at 4, 0.25 at 5); with capture pinned at its widest
+ * the margin is pinned at its widest too, 0.25, for the same reason the
+ * threshold is: corroboration is exactly the kind of weak-but-real evidence the
+ * operator asked to have captured and filtered afterwards rather than gated
+ * before the run.
  *
- * ...BUT THE FLOOR IT REACHES DOWN TO IS CLAMPED, and that clamp is load-bearing.
- * The rule's floor is `threshold - margin`, and at sensitivity 5 that arithmetic
- * is 0.2 - 0.25 = -0.05: a NEGATIVE floor, which every score in the matrix
- * clears. MEASURED on the first run of the widened dial, before the clamp
- * existed: on the 12-minute reference video every one of the 159 sentences was
- * "rescued" on all 10 categories at scores of 0.000-0.008, which is not
+ * ...BUT THE FLOOR IT REACHES DOWN TO IS CLAMPED, AND THAT CLAMP IS LOAD-BEARING.
+ * DO NOT REMOVE IT. The rule's floor is `threshold - margin`, and that
+ * arithmetic is now 0.2 - 0.25 = -0.05: a NEGATIVE floor, which every score in
+ * the matrix clears. MEASURED on the first run of the widened dial, before the
+ * clamp existed: on the 12-minute reference video every one of the 159 sentences
+ * was "rescued" on all 10 categories at scores of 0.000-0.008, which is not
  * corroboration, it is forwarding the transcript — ~1600 verifier calls on the
  * short video and roughly 8000 (about seven hours on the 27b) on the long one.
  *
@@ -425,25 +415,28 @@ const WINDOW_MAX_MERGED_SECONDS = 40;
  * not two hypotheses nearly entailing a sentence; they are two hypotheses that
  * both said no. The rule only means anything while its floor sits somewhere a
  * near-miss can actually land, and 0.15 is the lowest score on these reference
- * videos that ever coincided with real content. In practice this makes the
- * effective floor 0.35 at sensitivity 3, and 0.15 at both 4 and 5 — still a
- * real widening (the band at 4 and 5 is everything from 0.15 up to the
- * threshold), just not an unbounded one.
+ * videos that ever coincided with real content. The effective band this rule
+ * reaches into is therefore everything from 0.15 up to the 0.2 capture
+ * threshold — a real widening, just not an unbounded one.
  *
- * MEASURED, and worth knowing before reading a log: the 0.15 margin at
- * sensitivities 1-3 has NEVER fired on either reference video. Every rescue is
- * logged individually with the floor it used, so the first run where the rule
- * does fire says so explicitly.
+ * MEASURED, and worth knowing before reading a log: at the OLD default's 0.7
+ * threshold with a 0.15 margin, this rule NEVER fired on either reference video.
+ * Every rescue is logged individually with the floor it used, so a run where the
+ * rule does fire says so explicitly.
  */
-const RESCUE_MARGIN_BY_SENSITIVITY: Record<1 | 2 | 3 | 4 | 5, number> = {
-  1: 0.15,
-  2: 0.15,
-  3: 0.15,
-  4: 0.2,
-  5: 0.25,
-};
+const RESCUE_MARGIN = 0.25;
 const RESCUE_MIN_SCORE = 0.15;
 const RESCUE_MIN_CATEGORIES = 2;
+
+/**
+ * The floor a near-miss category must reach to corroborate: the capture
+ * threshold less the rescue margin, CLAMPED at RESCUE_MIN_SCORE.
+ *
+ * 0.2 - 0.25 = -0.05, so without the clamp this is the negative floor described
+ * above and every score in the matrix clears it. With it, the floor is 0.15 —
+ * the band this rule reaches into is everything from 0.15 up to 0.2.
+ */
+const RESCUE_FLOOR = Math.max(CAPTURE_THRESHOLD - RESCUE_MARGIN, RESCUE_MIN_SCORE);
 
 /**
  * SLIDING-WINDOW SCORING — the second ranking pass.
@@ -761,26 +754,102 @@ export class NliRankerService implements OnApplicationShutdown {
   }
 
   /**
-   * Threshold for this run's sensitivity dial. Exposed so the caller can log the
-   * number it is actually running at.
+   * The COMMITTED copy of worker.py, if this build carries one.
+   *
+   * WHY THERE ARE TWO COPIES AT ALL. The worker that actually runs lives in the
+   * user's app-support directory next to its venv and its pre-downloaded model,
+   * because that is where an installer can put a Python environment and a 400MB
+   * model. For a long time that was the ONLY copy: the file was never in the
+   * repository, so the source of truth for a load-bearing, measured piece of the
+   * flag pipeline was one directory on one machine, unversioned and unreviewable.
+   * The repository copy (backend/python/nli-worker/worker.py, shipped to
+   * dist/python by the assets rule already in nest-cli.json) is now the source of
+   * truth for review and history.
+   *
+   * THE APP-SUPPORT COPY STILL WINS AT RUN TIME. It is the one beside the venv
+   * that can import transformers, and swapping to the repo copy would run a file
+   * against an environment it was not installed with. What this method buys is
+   * DRIFT DETECTION, nothing more: if the two differ, the log says so once, with
+   * both hashes, so "the committed worker and the running worker are not the
+   * same program" is a visible fact instead of a silent one.
+   *
+   * THIS IS NOT AN INSTALLER. Nothing here copies, syncs, repairs or overwrites
+   * anything. Getting the right worker.py into app-support alongside its venv is
+   * the component manager's job.
    */
-  thresholdForSensitivity(sensitivity: number | undefined): number {
-    return THRESHOLD_BY_SENSITIVITY[normalizeSensitivity(sensitivity)];
+  private repoWorkerPath(): string | null {
+    // Compiled layout:  dist/analysis/nli-ranker.service.js  ->  dist/python/...
+    // Source layout:    src/analysis/nli-ranker.service.ts   ->  python/...
+    const candidates = [
+      path.join(__dirname, '..', 'python', 'nli-worker', 'worker.py'),
+      path.join(__dirname, '..', '..', 'python', 'nli-worker', 'worker.py'),
+    ];
+    for (const candidate of candidates) {
+      try {
+        if (fs.existsSync(candidate)) return candidate;
+      } catch {
+        // Unreadable path is the same as absent for this purpose.
+      }
+    }
+    return null;
   }
 
+  private static readonly sha256 = (file: string): string | null => {
+    try {
+      return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    } catch {
+      return null;
+    }
+  };
+
   /**
-   * The score a near-miss category must reach to corroborate at this
-   * sensitivity: the threshold less this level's rescue margin, but never below
-   * RESCUE_MIN_SCORE — see the RESCUE_MARGIN_BY_SENSITIVITY comment for the
-   * measured reason that clamp exists. Exposed alongside the threshold so a
-   * run's log can state both numbers.
+   * Compare the worker that is about to run against the committed one and say so
+   * in the log. NEVER throws and never changes what runs — see repoWorkerPath.
+   * Called once per worker start, which is once per analysis at most.
    */
-  rescueFloorForSensitivity(sensitivity: number | undefined): number {
-    const level = normalizeSensitivity(sensitivity);
-    return Math.max(
-      THRESHOLD_BY_SENSITIVITY[level] - RESCUE_MARGIN_BY_SENSITIVITY[level],
-      RESCUE_MIN_SCORE,
+  private reportWorkerDrift(runningWorker: string): void {
+    const repoWorker = this.repoWorkerPath();
+    if (!repoWorker) {
+      this.logger.debug(
+        '[NLI] No committed worker.py in this build to compare against — drift detection skipped.',
+      );
+      return;
+    }
+    if (path.resolve(repoWorker) === path.resolve(runningWorker)) return;
+
+    const running = NliRankerService.sha256(runningWorker);
+    const committed = NliRankerService.sha256(repoWorker);
+    if (!running || !committed) {
+      this.logger.debug('[NLI] Could not hash one of the worker.py copies — drift detection skipped.');
+      return;
+    }
+    if (running === committed) {
+      this.logger.log(`[NLI] worker.py matches the committed copy (sha256 ${running.slice(0, 12)}).`);
+      return;
+    }
+    this.logger.warn(
+      `[NLI] WORKER DRIFT: the worker.py being run is NOT the committed one. ` +
+      `running ${runningWorker} sha256 ${running.slice(0, 12)}; ` +
+      `committed ${repoWorker} sha256 ${committed.slice(0, 12)}. ` +
+      `The running copy is used as-is — this is a report, not a repair. Measured behavior ` +
+      `(batch size, hypothesis template, multi_label) is calibrated against the committed copy, so a ` +
+      `difference here can move flag scores without moving any threshold in this file.`,
     );
+  }
+
+
+  /**
+   * The capture threshold every run uses. Exposed as a getter (not a parameter)
+   * so a caller can state the number in its log without being able to change it
+   * — see CAPTURE_THRESHOLD for why this stopped being a run input.
+   */
+  get captureThreshold(): number {
+    return CAPTURE_THRESHOLD;
+  }
+
+  /** The clamped corroboration floor every run uses. See RESCUE_FLOOR. */
+  get rescueFloor(): number {
+    return RESCUE_FLOOR;
   }
 
   /**
@@ -868,6 +937,8 @@ export class NliRankerService implements OnApplicationShutdown {
     if (!fs.existsSync(dir)) return this.markUnavailable(`worker directory not found: ${dir}`);
     if (!fs.existsSync(worker)) return this.markUnavailable(`worker.py not found in ${dir}`);
     if (!fs.existsSync(python)) return this.markUnavailable(`venv python not found: ${python}`);
+
+    this.reportWorkerDrift(worker);
 
     let child: ChildProcessWithoutNullStreams;
     try {
@@ -1029,23 +1100,17 @@ export class NliRankerService implements OnApplicationShutdown {
   async rankSentences(
     sentences: RankedSentence[],
     categories: AnalysisCategory[],
-    sensitivity?: number,
   ): Promise<FlagCandidate[]> {
     const plan = this.buildPlan(categories);
     if (plan.length === 0 || sentences.length === 0) return [];
-    return this.scoreSentenceLevel(
-      sentences,
-      plan,
-      this.thresholdForSensitivity(sensitivity),
-      this.rescueFloorForSensitivity(sensitivity),
-    );
+    return this.scoreSentenceLevel(sentences, plan, CAPTURE_THRESHOLD, RESCUE_FLOOR);
   }
 
   private async scoreSentenceLevel(
     sentences: RankedSentence[],
     plan: RankPlan[],
-    threshold: number,
-    rescueFloor: number = THRESHOLD_BY_SENSITIVITY[2] - RESCUE_MARGIN_BY_SENSITIVITY[2],
+    threshold: number = CAPTURE_THRESHOLD,
+    rescueFloor: number = RESCUE_FLOOR,
   ): Promise<FlagCandidate[]> {
     const { texts: hypotheses, owner } = flattenHypotheses(plan);
     const raw = await this.score(
@@ -1213,19 +1278,22 @@ export class NliRankerService implements OnApplicationShutdown {
    * sliding windows, union the two, then group the survivors into merged
    * verification windows, strongest first.
    *
-   * Ordering is by the window's noisy-OR score so a run that is interrupted, or
-   * watched live, surfaces the worst passages first. It does NOT gate anything:
-   * the caller verifies every window and every category in it.
+   * Ordering is by the window's noisy-OR score, DESCENDING, and that ordering is
+   * load-bearing rather than cosmetic: the caller verifies in exactly this order,
+   * so a run that is interrupted — killed, crashed, or abandoned by the user —
+   * has already finished and stored its most trustworthy findings, and the
+   * question-keyed verdict cache means the resumed run starts where it stopped.
+   * It does NOT gate anything: the caller verifies every window and every
+   * category in it.
    */
   async rankWindows(
     sentences: RankedSentence[],
     categories: AnalysisCategory[],
-    sensitivity?: number,
   ): Promise<FlagWindow[]> {
     const plan = this.buildPlan(categories);
     if (plan.length === 0 || sentences.length === 0) return [];
-    const threshold = this.thresholdForSensitivity(sensitivity);
-    const rescueFloor = this.rescueFloorForSensitivity(sensitivity);
+    const threshold = CAPTURE_THRESHOLD;
+    const rescueFloor = RESCUE_FLOOR;
 
     const sentenceLevel = await this.scoreSentenceLevel(sentences, plan, threshold, rescueFloor);
     const windowLevel = await this.scoreWindowLevel(sentences, plan, threshold, sentenceLevel);

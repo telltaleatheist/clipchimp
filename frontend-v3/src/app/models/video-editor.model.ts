@@ -29,6 +29,23 @@ export interface TimelineSection {
   category: string;
   description: string;
   color: string;
+  /**
+   * The flag verifier's answer for this passage and category — 'flag' when it
+   * judged the speaker to be asserting the claim, 'skip' when it judged them to
+   * be reporting, quoting, questioning or opposing it.
+   *
+   * The analysis stores BOTH, so the display filter can show or hide the
+   * rejections without a re-run. NULL on legacy rows, on custom markers and on
+   * the discovery fallback path, and NULL is read as 'flag' everywhere — see
+   * models/flag-filter.ts.
+   */
+  verdict?: 'flag' | 'skip' | null;
+  /**
+   * The NLI ranker's score for this section's category, 0-1 — the number the
+   * STRICT (>= 0.9) and MODERATE (>= 0.7) filter positions threshold on. NULL
+   * wherever there is no ranker score, and NULL passes every position.
+   */
+  nliScore?: number | null;
 }
 
 export interface TimelineChapter {

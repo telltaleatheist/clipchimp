@@ -1,6 +1,7 @@
 import { Component, Input, Output, EventEmitter, OnChanges, SimpleChanges } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { TimelineSection, ZoomState } from '../../../../models/video-editor.model';
+import { VERIFIER_REJECTION_LABEL, isGhosted } from '../../../../models/flag-filter';
 
 interface SectionStyle {
   left: string;
@@ -19,6 +20,18 @@ interface SectionStyle {
 })
 export class TimelineSectionsLayerComponent implements OnChanges {
   @Input() sections: TimelineSection[] = [];
+
+  readonly verifierRejectionLabel = VERIFIER_REJECTION_LABEL;
+
+  /**
+   * True for a marker the verifier REJECTED. Only ever present in `sections` at
+   * the LOOSE filter position; it renders ghosted and behind the solid markers
+   * rather than being dropped, so the timeline shows what was considered as well
+   * as what was kept.
+   */
+  isGhostSection(section: TimelineSection): boolean {
+    return isGhosted(section);
+  }
   @Input() duration: number = 0;
   @Input() zoomState: ZoomState = { level: 1, offset: 0 };
   @Input() selectedSection?: TimelineSection;
