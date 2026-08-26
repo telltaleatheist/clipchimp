@@ -442,17 +442,18 @@
     box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
   }
 
-  // GHOSTED: a passage the verifier rejected as reported/opposed rather than
-  // asserted. Only rendered at the LOOSE position. It is dimmed and its left
-  // rail is dashed, so it reads as "considered and set aside" rather than as a
-  // finding — but it is still clickable and still seeks, because the whole point
-  // of showing it is that a human can go and check the machine's judgment.
+  // REJECTED: a passage the verifier judged reported/opposed rather than
+  // asserted. Only rendered at the LOOSE position.
+  //
+  // NOT dimmed. Asking for LOOSE is asking to READ these — the point is to
+  // check the machine's judgment, which is impossible through 45% opacity. The
+  // distinction is carried by the dashed rail and the explicit rejection badge,
+  // which say "considered and set aside" without costing legibility.
   &.ghosted {
-    opacity: 0.45;
     border-left-style: dashed;
 
-    &:hover {
-      opacity: 0.75;
+    .section-description {
+      font-style: italic;
     }
   }
 }

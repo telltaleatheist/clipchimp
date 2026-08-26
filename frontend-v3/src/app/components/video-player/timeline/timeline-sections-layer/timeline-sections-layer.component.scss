@@ -26,17 +26,20 @@
     z-index: 10;
   }
 
-  // GHOSTED: the verifier read this passage as reported/opposed rather than
-  // asserted, so it only appears at the LOOSE filter position. Dimmed and
-  // dashed, and pushed BEHIND solid markers so a real flag is never obscured by
-  // a rejection sitting over the same seconds of timeline.
+  // REJECTED: the verifier read this passage as reported/opposed rather than
+  // asserted, so it only appears at the LOOSE filter position.
+  //
+  // Kept clearly VISIBLE — LOOSE exists to show these, and a marker at 0.3
+  // opacity is one you cannot find on a timeline. The dashed border carries the
+  // distinction instead. Still pushed BEHIND solid markers (z-index) so a real
+  // flag is never obscured by a rejection over the same seconds.
   &.ghosted {
-    opacity: 0.3;
+    opacity: 0.8;
     border-style: dashed;
     z-index: 0;
 
     &:hover {
-      opacity: 0.6;
+      opacity: 1;
     }
   }
 }
