@@ -114,9 +114,17 @@ export class QueueTabComponent {
     this.armedClear.set(null);
   }
 
-  /** First click arms the option; the second click executes it. */
+  /**
+   * Destructive options arm on the first click and execute on the second.
+   *
+   * 'completed' is NOT destructive and is therefore NOT armed: those rows are
+   * finished work, and removing them from a list deletes no video, no analysis
+   * and no file — the only thing lost is the row itself, which the next run
+   * recreates. Making it confirm cost three clicks (open menu, arm, confirm) to
+   * tidy a list, so it fires immediately.
+   */
   onClearOption(option: ClearOption): void {
-    if (this.armedClear() !== option) {
+    if (option !== 'completed' && this.armedClear() !== option) {
       this.armedClear.set(option);
       return;
     }

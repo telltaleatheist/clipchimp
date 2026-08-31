@@ -521,13 +521,24 @@ export class QueueManagerService implements OnModuleDestroy, OnModuleInit {
    * Clear completed/failed jobs
    */
   clearCompletedJobs(): void {
+    // 'cancelled' belongs here with the other finished states. Leaving it out
+    // meant a cancelled job could never be cleared by any means — it is not
+    // running, so Stop does nothing to it, and Clear skipped it — so cancelled
+    // rows accumulated in the queue forever.
+    const FINISHED = new Set(['completed', 'failed', 'cancelled']);
+    let cleared = 0;
     for (const [jobId, job] of this.jobQueue.entries()) {
-      if (job.status === 'completed' || job.status === 'failed') {
+      if (FINISHED.has(job.status)) {
         this.jobQueue.delete(jobId);
+        // The cancellation set is keyed by job id and consulted by running
+        // tasks; a job that no longer exists cannot be asked about again, so
+        // its entry would leak for the process lifetime.
+        this.cancelledJobs.delete(jobId);
+        cleared++;
       }
     }
 
-    this.logger.log('Cleared completed/failed jobs');
+    this.logger.log(`Cleared ${cleared} finished job(s) (completed/failed/cancelled)`);
   }
 
   /**

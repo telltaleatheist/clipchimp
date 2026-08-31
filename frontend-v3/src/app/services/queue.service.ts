@@ -452,7 +452,12 @@ export class QueueService implements OnDestroy {
   }
 
   /**
-   * Clear all completed/failed jobs
+   * Clear all completed/failed/cancelled jobs, HERE AND ON THE BACKEND.
+   *
+   * The backend call is not optional bookkeeping: the queue is re-hydrated from
+   * `GET /queue/status`, so clearing only this signal made the rows vanish and
+   * then reappear the moment anything else refreshed the queue. The visible
+   * symptom was "clear doesn't stick" — it did, for about a second.
    */
   clearCompleted(): void {
     const completedIds = this.jobs()
@@ -471,6 +476,18 @@ export class QueueService implements OnDestroy {
     this.jobs.update(jobs =>
       jobs.filter(job => job.state !== 'completed' && job.state !== 'failed')
     );
+
+    this.http.delete<{ success?: boolean }>(`${this.API_BASE}/queue/jobs/completed`).pipe(
+      catchError(error => {
+        // The local list is already clear; say so plainly rather than silently
+        // letting the rows walk back in on the next status refresh.
+        this.errorSurface.surfaceError(
+          "Backend didn't confirm clear — cleared items may reappear",
+          error
+        );
+        return of(undefined);
+      })
+    ).subscribe();
   }
 
   /**

@@ -39,7 +39,8 @@
     </div>
   </div>
 
-  <!-- Clear ▾ menu: each destructive option is two-click confirmed inline. -->
+  <!-- Clear ▾ menu: the DESTRUCTIVE options are two-click confirmed inline.
+       Clearing completed rows destroys nothing, so it fires on one click. -->
   <ng-template
     cdkConnectedOverlay
     [cdkConnectedOverlayOrigin]="clearTrigger"
@@ -51,8 +52,8 @@
     (detach)="closeClearMenu()">
     <div class="clear-menu" role="menu" aria-label="Clear queue items">
       @if (completedCount() > 0) {
-        <button role="menuitem" class="clear-option" [class.armed]="armedClear() === 'completed'" (click)="onClearOption('completed')">
-          {{ armedClear() === 'completed' ? 'Clear ' + completedCount() + ' completed — sure?' : 'Completed (' + completedCount() + ')' }}
+        <button role="menuitem" class="clear-option" (click)="onClearOption('completed')">
+          {{ 'Completed (' + completedCount() + ')' }}
         </button>
       }
       @if (selectedStagingIds().size > 0) {
