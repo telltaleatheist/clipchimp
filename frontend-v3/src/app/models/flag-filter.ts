@@ -9,61 +9,90 @@
  *    UI component that filters out loose pairings rather than defining what the
  *    actual run does before it runs."
  *
- * The analysis now captures at its widest setting every time (NLI threshold 0.2,
+ * The analysis captures at its widest setting every time (NLI threshold 0.2,
  * rescue floor 0.15), asks the verifier about every candidate it captured, and
  * stores BOTH answers — accepted and rejected — with the ranker score behind
  * each one. So what a user sees is a pure function of stored data, and moving
  * this control is a client-side array filter: instant, free, reversible, and
  * incapable of losing a finding, because nothing was thrown away to make it.
  *
- * THE THREE POSITIONS, and why they threshold where they do:
+ * ── WHY THE POSITIONS CHANGED (operator, 2026-08-31) ────────────────────────
  *
- *   STRICT    verdict 'flag' AND score >= 0.9. 0.9 was the old dial's top
- *             position, "near-certain entailment only".
- *   MODERATE  verdict 'flag' AND score >= 0.7. 0.7 is THE CALIBRATED VALUE: it
- *             kept 100% of the non-marginal hand-audit ground truth on both
- *             reference videos, and a default run before this change captured at
- *             exactly this threshold. MODERATE is therefore the position that
- *             reproduces what the product used to do.
- *   LOOSE     everything captured, INCLUDING the verifier's rejections, which
- *             render ghosted and labelled rather than hidden. This is the
- *             position that makes the pipeline auditable: "what did the machine
- *             decide not to show me, and why" becomes a question with an answer
- *             on screen.
+ * The first version thresholded on the NLI score at every position: STRICT was
+ * flag >= 0.9, MODERATE flag >= 0.7, LOOSE everything. Measured on four real
+ * analyses, that produced 7 / 10 / 184 — two nearly identical positions and a
+ * cliff — because the score is BIMODAL. It answers "is this passage on-topic
+ * for this category", and among passages the verifier already accepted it sits
+ * at the top of its range almost every time. Slicing accepted flags by it moved
+ * three rows.
+ *
+ * Worse, it was slicing the wrong quantity. In this pipeline the ranker is a
+ * CANDIDATE GENERATOR and the verifier is the JUDGMENT SEAT: the score says
+ * "worth asking about", the verdict says "yes, the speaker is asserting this".
+ * So the old MODERATE default was hiding rows the verifier had confirmed
+ * because the ranker's topical score was low — 3 on one reference video, 5 on
+ * another, including a conspiracy quote the verifier accepted at score 0.45.
+ * Overruling the judgment seat with the candidate generator's confidence
+ * inverts the architecture, and it hid real findings by default.
+ *
+ * So the ladder now moves along the axis that actually has structure — the
+ * verdict — and uses the score only where it discriminates: ordering the
+ * REJECTED candidates, where it spreads across the full range.
+ *
+ * THE THREE POSITIONS:
+ *
+ *   CONFIRMED  Every passage the verifier accepted. No score floor: if the
+ *              verifier said the speaker is asserting it, it is a finding, and
+ *              no position hides it. This is the default.
+ *   REVIEW     Confirmed, plus the rejected candidates the ranker was most
+ *              certain about topically (score >= NEAR_MISS_SCORE). These are
+ *              exactly the passages where the verifier is most worth
+ *              second-guessing: the topic match was unambiguous and the call
+ *              turned on stance alone. Rejections render ghosted and labelled.
+ *   ALL        Everything captured, down to the widest rescue floor.
+ *
+ * Measured tier sizes on four real analyses (confirmed / review / all):
+ *   13 / 79 / 184 · 16 / 37 / 129 · 2 / 32 / 109 · 6 / 20 / 45
+ * Each position is a superset of the one before it, and each adds a
+ * meaningfully different KIND of row rather than a few more of the same kind.
+ * The control shows live counts so the size of a position is never a surprise.
  *
  * LEGACY AND DISCOVERY ROWS ALWAYS PASS. A row written before verdicts were
  * stored, or by the discovery fallback path (which has no per-candidate score
  * and produces no rejected candidates), carries a null verdict and a null score.
- * Every position treats null as "a flag that passes every threshold", so an old
- * library renders exactly as it did before this filter existed. Hiding somebody's
- * existing flags behind a new control they have never touched would be the one
- * unacceptable outcome here.
+ * Every position treats null as an accepted flag, so an old library renders
+ * exactly as it did before this filter existed. Hiding somebody's existing flags
+ * behind a new control they have never touched would be the one unacceptable
+ * outcome here.
  */
-export type FlagFilter = 'strict' | 'moderate' | 'loose';
+export type FlagFilter = 'confirmed' | 'review' | 'all';
 
-export const FLAG_FILTERS: FlagFilter[] = ['strict', 'moderate', 'loose'];
+export const FLAG_FILTERS: FlagFilter[] = ['confirmed', 'review', 'all'];
 
-/** Minimum NLI score a 'flag' row needs at each position. LOOSE has no floor. */
-export const FLAG_FILTER_MIN_SCORE: Record<FlagFilter, number> = {
-  strict: 0.9,
-  moderate: 0.7,
-  loose: 0,
-};
+/**
+ * The score at or above which a REJECTED candidate is shown at REVIEW.
+ *
+ * 0.9 is where the ranker's bimodal distribution puts its high mode, so this
+ * selects rejections whose topical match was not in doubt — the ones whose fate
+ * was decided purely by the asserting-vs-reporting test, which is the judgment
+ * a human is best placed to check. It is NEVER applied to accepted flags.
+ */
+export const NEAR_MISS_SCORE = 0.9;
 
 export const FLAG_FILTER_LABEL: Record<FlagFilter, string> = {
-  strict: 'Strict',
-  moderate: 'Moderate',
-  loose: 'Loose',
+  confirmed: 'Confirmed',
+  review: 'Review',
+  all: 'All',
 };
 
 export const FLAG_FILTER_DESCRIPTION: Record<FlagFilter, string> = {
-  strict: 'Only the strongest matches (score 0.90 and above).',
-  moderate: 'The calibrated default: confirmed matches at 0.70 and above.',
-  loose: 'Everything the analysis captured, including passages the verifier rejected (shown ghosted).',
+  confirmed: 'Everything the verifier confirmed as asserted by the speaker.',
+  review: 'Confirmed, plus rejected passages the ranker was most sure about — the verifier’s closest calls.',
+  all: 'Every passage the analysis captured, including everything the verifier rejected.',
 };
 
 /**
- * The caption shown on a ghosted row, in the verifier's own terms.
+ * The caption shown on a rejected row, in the verifier's own terms.
  *
  * It says what the verifier DECIDED, not that the row is unimportant: the
  * verifier's one question is "is the speaker asserting this claim, or reporting
@@ -89,20 +118,27 @@ export interface FlagFilterable {
 
 /** True when this section should be visible at this filter position. */
 export function passesFlagFilter(section: FlagFilterable, filter: FlagFilter): boolean {
-  // LOOSE shows everything, rejections included — that is the whole point of it.
-  if (filter === 'loose') return true;
+  // ALL shows everything, rejections included — that is the whole point of it.
+  if (filter === 'all') return true;
 
   // Null verdict = legacy/discovery. Treated as an accepted flag.
-  if ((section.verdict ?? 'flag') === 'skip') return false;
+  const verdict = section.verdict ?? 'flag';
 
-  // Null score = no ranker score to threshold on. Passes, for the same reason.
+  // An accepted flag is a finding at EVERY position. The score never overrules
+  // the verifier — see the note at the top of this file.
+  if (verdict === 'flag') return true;
+
+  // Rejected: shown only at REVIEW, and only when the ranker was highly certain
+  // the passage was on-topic, so the rejection turned on stance alone.
+  if (filter !== 'review') return false;
+
   const score = section.nliScore;
-  if (score === null || score === undefined || !Number.isFinite(score)) return true;
+  if (score === null || score === undefined || !Number.isFinite(score)) return false;
 
-  return score >= FLAG_FILTER_MIN_SCORE[filter];
+  return score >= NEAR_MISS_SCORE;
 }
 
-/** True when this section should be rendered ghosted rather than solid. */
+/** True when this section should be rendered as a verifier rejection. */
 export function isGhosted(section: FlagFilterable): boolean {
   return section.verdict === 'skip';
 }
@@ -118,11 +154,10 @@ export function isGhosted(section: FlagFilterable): boolean {
  * preferences do — localStorage, read on construction, written on change, same
  * as the analysis panel's "follow cursor" toggle right next to it.
  *
- * FIRST USE IS MODERATE. That is the calibrated position: >= 0.7 is the
- * threshold that kept 100% of the non-marginal hand-audit ground truth on both
- * reference videos, and it is what a default run produced before any of this
- * changed. Somebody opening the editor for the first time sees what the product
- * has always shown them.
+ * FIRST USE IS CONFIRMED: the verifier's own answer, nothing hidden and nothing
+ * speculative added. A stored value from the previous three-position scheme
+ * ('strict' | 'moderate' | 'loose') maps forward rather than being discarded, so
+ * nobody's saved preference silently resets.
  *
  * `defaultGranularity` in app-config.json still exists and is NOT read here. It
  * survives for the DISCOVERY fallback flag path only — a machine with no NLI
@@ -132,14 +167,23 @@ export function isGhosted(section: FlagFilterable): boolean {
  */
 const FLAG_FILTER_STORAGE_KEY = 'briefcase-flag-filter';
 
+/** Positions from the superseded scheme, mapped to their closest equivalent. */
+const LEGACY_FILTER_ALIASES: Record<string, FlagFilter> = {
+  strict: 'confirmed',
+  moderate: 'confirmed',
+  loose: 'all',
+};
+
 export function loadFlagFilter(): FlagFilter {
   try {
-    if (typeof localStorage === 'undefined') return 'moderate';
+    if (typeof localStorage === 'undefined') return 'confirmed';
     const stored = localStorage.getItem(FLAG_FILTER_STORAGE_KEY);
-    return FLAG_FILTERS.includes(stored as FlagFilter) ? (stored as FlagFilter) : 'moderate';
+    if (stored && FLAG_FILTERS.includes(stored as FlagFilter)) return stored as FlagFilter;
+    if (stored && LEGACY_FILTER_ALIASES[stored]) return LEGACY_FILTER_ALIASES[stored];
+    return 'confirmed';
   } catch {
     // A blocked or full localStorage must never decide what flags a user sees.
-    return 'moderate';
+    return 'confirmed';
   }
 }
 

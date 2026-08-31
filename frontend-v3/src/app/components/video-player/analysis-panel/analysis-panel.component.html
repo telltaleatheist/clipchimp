@@ -156,11 +156,11 @@
         @if (sections.length === 0) {
           <div class="empty-state">
             <p>No flagged sections found</p>
-            @if (flagFilter !== 'loose' && flagFilterCounts.loose > 0) {
+            @if (flagFilter !== 'all' && flagFilterCounts.all > 0) {
               <!-- The analysis DID find things; this position is hiding them.
                    Say so, rather than letting the filter look like an empty run. -->
               <p class="empty-hint">
-                {{ flagFilterCounts.loose }} captured at Loose — this filter is hiding them all
+                {{ flagFilterCounts.all }} captured in total — switch to All to see what the verifier rejected
               </p>
             } @else {
               <p class="empty-hint">Press M to add a marker</p>

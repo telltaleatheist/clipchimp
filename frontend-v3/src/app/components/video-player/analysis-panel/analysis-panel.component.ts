@@ -39,9 +39,9 @@ export class AnalysisPanelComponent implements OnChanges {
    * filter applied — the control is here because this is where a user looks at
    * findings, not because this component decides what is visible.
    */
-  @Input() flagFilter: FlagFilter = 'moderate';
+  @Input() flagFilter: FlagFilter = 'confirmed';
   /** Per-position counts, so the control says what pressing it will do. */
-  @Input() flagFilterCounts: Record<FlagFilter, number> = { strict: 0, moderate: 0, loose: 0 };
+  @Input() flagFilterCounts: Record<FlagFilter, number> = { confirmed: 0, review: 0, all: 0 };
   @Output() sectionClick = new EventEmitter<TimelineSection>();
   @Output() sectionDelete = new EventEmitter<string>(); // section id
   @Output() chapterClick = new EventEmitter<TimelineChapter>();

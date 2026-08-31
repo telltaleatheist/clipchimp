@@ -684,9 +684,9 @@ export class VideoPlayerComponent implements OnInit, OnDestroy {
       ? this.sections()
       : this.sections().filter(s => enabled.has(s.category.toLowerCase()));
     return {
-      strict: scoped.filter(s => passesFlagFilter(s, 'strict')).length,
-      moderate: scoped.filter(s => passesFlagFilter(s, 'moderate')).length,
-      loose: scoped.length,
+      confirmed: scoped.filter(s => passesFlagFilter(s, 'confirmed')).length,
+      review: scoped.filter(s => passesFlagFilter(s, 'review')).length,
+      all: scoped.length,
     };
   });
 
