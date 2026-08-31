@@ -43,6 +43,12 @@ export interface LlamaGenerateResult {
 export interface LlamaGenerateOptions {
   /** Sampling temperature. JSON tasks want ~0.15; free text a little higher. */
   temperature?: number;
+  /**
+   * Caller cancellation (a cancelled analysis job). Aborts the request in
+   * addition to the built-in REQUEST_TIMEOUT_MS abort, so cancelling a job
+   * running on the bundled local model stops it as promptly as it stops Ollama.
+   */
+  signal?: AbortSignal;
 }
 
 export class LlamaBridge extends EventEmitter {
@@ -401,6 +407,10 @@ export class LlamaBridge extends EventEmitter {
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), this.REQUEST_TIMEOUT_MS);
+    // Caller cancellation shares the timeout's controller; the caller
+    // distinguishes the two by checking its own signal (see ai-provider).
+    const onCallerAbort = () => controller.abort();
+    options?.signal?.addEventListener('abort', onCallerAbort, { once: true });
 
     try {
       const response = await fetch(`http://localhost:${this.config.port}/v1/chat/completions`, {
@@ -440,6 +450,9 @@ export class LlamaBridge extends EventEmitter {
       clearTimeout(timeout);
 
       if (error.name === 'AbortError') {
+        // Rethrow the raw abort when the CALLER asked for it, so ai-provider can
+        // report it as a cancellation instead of a timeout.
+        if (options?.signal?.aborted) throw error;
         throw new Error('Request timeout - generation took too long');
       }
 
@@ -451,6 +464,8 @@ export class LlamaBridge extends EventEmitter {
 
       throw error;
     } finally {
+      clearTimeout(timeout);
+      options?.signal?.removeEventListener('abort', onCallerAbort);
       // Re-arm the idle shutdown now that the request has finished.
       this.resetIdleTimer();
     }

@@ -10,7 +10,9 @@
  * Metadata (description, tags, title) is generated from chapter summaries.
  */
 import { Injectable, Logger, Optional } from '@nestjs/common';
+import { OnEvent } from '@nestjs/event-emitter';
 import { AIProviderService, AIProviderConfig } from './ai-provider.service';
+import { ensureNotCancelled, isCancellation } from './cancellation';
 import { OllamaService } from './ollama.service';
 import { estimateNumCtx, numCtxMaxForModel, parseProviderModel, AITaskKind } from './model-utils';
 import { ChapterDetectionService } from './chapter-detection.service';
@@ -152,6 +154,17 @@ export interface AnalysisOptions {
   apiKey?: string;
   ollamaEndpoint?: string;
   onProgress?: (progress: AnalysisProgress) => void;
+  /**
+   * Queue job this analysis belongs to. Supplying it is what makes the run
+   * CANCELLABLE: the run registers under this id, and `job.cancel-requested`
+   * for the same id aborts its in-flight call, stops its stage loops, kills the
+   * NLI worker and releases the models it loaded.
+   *
+   * Optional because the standalone analysis controller and the smoke harnesses
+   * have no queue job. Those runs behave exactly as before — uncancellable, but
+   * unaffected by anyone else's cancel.
+   */
+  jobId?: string;
 }
 
 export interface TokenStats {
@@ -545,6 +558,97 @@ export class AIAnalysisService {
     @Optional() private readonly databaseService?: DatabaseService,
   ) {}
 
+  // ===========================================================================
+  // CANCELLATION
+  // ===========================================================================
+
+  /**
+   * Analyses currently in flight, keyed by queue job id.
+   *
+   * The AI pool is single-slot, so in practice this holds at most one entry —
+   * but it is a MAP rather than a single field on purpose. The standalone
+   * analysis controller can start a run outside the queue, and model release
+   * has to be able to answer "is any other run still using this model" before
+   * it unloads anything. A single field could not.
+   */
+  private readonly activeRuns = new Map<
+    string,
+    {
+      controller: AbortController;
+      /** `${endpoint}::${model}` for every Ollama model this run may load. */
+      ollamaKeys: Set<string>;
+    }
+  >();
+
+  /**
+   * Cancel the analysis belonging to one queue job.
+   *
+   * Scoped per job, exactly like whisper/ffmpeg/downloader's handlers: an id we
+   * are not running is a no-op, so cancelling a download cannot disturb an
+   * analysis and vice versa. Idempotent.
+   */
+  @OnEvent('job.cancel-requested')
+  handleJobCancelRequested(payload: { jobId?: string }): void {
+    const jobId = payload?.jobId;
+    if (!jobId) return;
+    this.cancelAnalysis(jobId);
+  }
+
+  /**
+   * The cancel itself, split out from the event handler so it can be driven
+   * directly (tests, and any future in-process caller).
+   *
+   * Order matters:
+   *   1. abort  — the open generation dies, and every stage loop's next
+   *               `ensureNotCancelled` throws instead of issuing another call;
+   *   2. NLI    — the worker holds a loaded model and ~1GB of python, and a
+   *               cancel landing mid-`rankWindows` would otherwise wait out the
+   *               scoring timeout before analyzeTranscript's finally could run;
+   *   3. models — released only after the abort, because Ollama serializes per
+   *               model and an unload queued behind a live generation would not
+   *               land until that generation finished.
+   *
+   * Returns false when no such run exists.
+   */
+  cancelAnalysis(jobId: string): boolean {
+    const run = this.activeRuns.get(jobId);
+    if (!run) return false;
+
+    this.logger.log(`Cancelling AI analysis for job ${jobId}`);
+    run.controller.abort();
+
+    // The ranker worker is a single shared process, so only tear it down when
+    // no OTHER run could be using it. With the single-slot AI pool this is
+    // always true; the guard is what keeps it true if that ever changes.
+    if (this.activeRuns.size === 1) {
+      this.nliRanker.stop();
+    } else {
+      this.logger.warn(
+        `[Cancel] ${this.activeRuns.size - 1} other analysis run(s) are active — leaving the NLI ` +
+        `ranker worker up rather than pulling it out from under them`,
+      );
+    }
+
+    // Release ONLY the models no other live run still needs. Ollama is shared
+    // with another app on this machine, and releaseOllamaModelKeys additionally
+    // intersects with what Briefcase itself actually loaded — so a model this
+    // run never touched, or that another app loaded, is never unloaded.
+    const stillNeeded = new Set<string>();
+    for (const [otherId, other] of this.activeRuns) {
+      if (otherId === jobId) continue;
+      for (const key of other.ollamaKeys) stillNeeded.add(key);
+    }
+    const releasable = [...run.ollamaKeys].filter((key) => !stillNeeded.has(key));
+
+    // Fire-and-forget: the cancel path must return promptly to the queue, and
+    // releaseOllamaModelKeys never throws.
+    void this.aiProviderService.releaseOllamaModelKeys(releasable).catch((error) => {
+      this.logger.warn(`[Cancel] Model release failed for job ${jobId}: ${(error as Error).message}`);
+    });
+
+    return true;
+  }
+
   /**
    * Per-task model routing, read from `taskModels` in app-config.json:
    *
@@ -796,7 +900,31 @@ export class AIAnalysisService {
       apiKey,
       ollamaEndpoint,
       onProgress,
+      jobId,
     } = options;
+
+    // ---- cancellation ------------------------------------------------------
+    // ONE signal for the whole run. Every stage loop checks it before starting
+    // its next unit of work and every provider call carries it, so a cancel
+    // both kills the open generation and stops the pipeline issuing more.
+    const controller = new AbortController();
+    const signal = controller.signal;
+    const run = { controller, ollamaKeys: new Set<string>() };
+
+    // EVERY run registers, even one with no queue job. A run without a jobId is
+    // not cancellable (nothing can name it), but it still has to be VISIBLE:
+    // model release and the NLI-worker teardown both ask "is anything else
+    // running", and an unregistered standalone analysis would have its model
+    // unloaded and its ranker killed out from under it by an unrelated cancel.
+    const runKey = jobId ?? `standalone-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const stale = this.activeRuns.get(runKey);
+    if (stale) {
+      // Can only happen if a previous run for this id never unwound. Abort it
+      // rather than orphaning its controller under the new registration.
+      this.logger.warn(`[Analysis] Replacing a still-registered run for job ${runKey}`);
+      stale.controller.abort();
+    }
+    this.activeRuns.set(runKey, run);
 
     // Sensitivity, USED ONLY BY THE DISCOVERY FALLBACK FLAG PATH: an explicit
     // value wins; otherwise the config file's stored default; otherwise the
@@ -931,6 +1059,23 @@ export class AIAnalysisService {
       // configured 'boundary' explicitly, or when Ollama is not reachable.
       await this.applyAutoPlacementModel(taskModels, ollamaEndpoint);
 
+      // Record every Ollama model this run can load, now that routing is
+      // settled. Cancellation releases exactly this set (intersected with what
+      // was actually loaded), so a shared Ollama never loses a model that
+      // belongs to another app — or to another Briefcase run.
+      {
+        const endpoint = ollamaEndpoint || 'http://localhost:11434';
+        if (aiConfig.provider === 'ollama') {
+          run.ollamaKeys.add(`${endpoint}::${aiConfig.model}`);
+        }
+        for (const task of ROUTABLE_TASKS) {
+          const cfg = this.resolveTaskConfig(aiConfig, task, taskModels);
+          if (cfg.provider === 'ollama') {
+            run.ollamaKeys.add(`${cfg.ollamaEndpoint || endpoint}::${cfg.model}`);
+          }
+        }
+      }
+
       // Effective context window each raw-transcript task will actually use.
       //
       // boundary / chapter / flags all read raw transcript, and each may now be
@@ -1014,6 +1159,7 @@ export class AIAnalysisService {
           const pct = 5 + Math.round((current / Math.max(1, total)) * 20);
           sendProgress('analysis', pct, label);
         },
+        signal,
       });
       const boundaries = detection.boundaries;
       sendProgress('analysis', 25, `Found ${boundaries.length} chapters (${detection.scorer} scoring)`);
@@ -1124,6 +1270,7 @@ export class AIAnalysisService {
           lastProgress = FLAG_BAND[0];
           sendProgress('analysis', lastProgress, message);
         },
+        signal,
       );
       lastProgress = METADATA_BAND[0];
       sendProgress('analysis', lastProgress, `Analyzed ${chapters.length} chapters, found ${flags.length} flags`);
@@ -1206,23 +1353,27 @@ export class AIAnalysisService {
       let metadataStepsDone = 0;
       for (const key of orderedKeys) {
         for (const step of metadataSteps.filter((s) => s.key === key)) {
+          // Each metadata step is 1-2 more generation calls. A cancelled run
+          // stops here rather than spending them.
+          ensureNotCancelled(signal, `metadata step '${step.task}'`);
+
           completedApiCalls += step.calls;
           lastProgress = bandProgress(METADATA_BAND, metadataStepsDone++, metadataSteps.length);
           sendProgress('analysis', lastProgress, `${step.label}...`);
           switch (step.task) {
             case 'description':
               description = await this.generateDescriptionFromChapters(
-                step.cfg, chapters, videoTitle, tags, recordFailure, trackTokens,
+                step.cfg, chapters, videoTitle, tags, recordFailure, trackTokens, signal,
               );
               break;
             case 'tags':
               tags = await this.generateTagsFromChapters(
-                step.cfg, chapters, recordFailure, trackTokens,
+                step.cfg, chapters, recordFailure, trackTokens, signal,
               );
               break;
             case 'title':
               suggestedTitle = await this.generateTitleFromChapters(
-                step.cfg, chapters, videoTitle, recordFailure, trackTokens,
+                step.cfg, chapters, videoTitle, recordFailure, trackTokens, signal,
               );
               break;
           }
@@ -1275,6 +1426,17 @@ export class AIAnalysisService {
         warnings: flagWarnings && flagWarnings.length > 0 ? flagWarnings : undefined,
       };
     } catch (error) {
+      // A cancellation is NOT a failure. It must not be wrapped as one (the
+      // wrapper would hide the type from every caller), must not be logged at
+      // ERROR level, and must reach media-operations as a cancellation so that
+      // nothing is persisted for the job.
+      if (isCancellation(error)) {
+        this.logger.log(
+          `AI analysis cancelled${jobId ? ` for job ${jobId}` : ''} after ${tokenStats.apiCalls} API call(s) ` +
+          `— no further calls will be issued and no results will be saved`,
+        );
+        throw error;
+      }
       const message = `AI analysis failed: ${(error as Error).message}`;
       this.logger.error(message);
       throw new Error(message);
@@ -1284,6 +1446,13 @@ export class AIAnalysisService {
       // also joins the app's graceful-shutdown path (OnApplicationShutdown), so
       // a crash mid-run cannot leave an orphan python behind either.
       this.nliRanker.stop();
+
+      // Deregister LAST, and identity-checked, so a cancel that arrives while
+      // this run is unwinding still finds it (and a replacement run registered
+      // under the same id is never deleted out from under itself).
+      if (this.activeRuns.get(runKey) === run) {
+        this.activeRuns.delete(runKey);
+      }
     }
   }
 
@@ -1346,6 +1515,7 @@ export class AIAnalysisService {
     previousChapterSummary: string,
     customInstructions: string | undefined,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
+    signal?: AbortSignal,
   ): Promise<ChapterAnalysisResult> {
     const maxRetries = JSON_PARSE_RETRIES;
     // Capture the underlying error so the final throw carries the real reason
@@ -1353,6 +1523,10 @@ export class AIAnalysisService {
     let lastError = '';
 
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
+      // A RETRY is another full call. Cancelling has to stop retries too, not
+      // just the first attempt.
+      ensureNotCancelled(signal, `chapter ${chapterNumber} attempt ${attempt + 1}`);
+
       try {
         const prompt = buildChapterAnalysisPrompt(
           videoTitle,
@@ -1362,7 +1536,7 @@ export class AIAnalysisService {
           customInstructions,
         );
 
-        const response = await this.aiProviderService.generateText(prompt, config, 'chapter');
+        const response = await this.aiProviderService.generateText(prompt, config, 'chapter', { signal });
         onTokens?.(response);
 
         if (!response || !response.text) {
@@ -1386,6 +1560,8 @@ export class AIAnalysisService {
           continue;
         }
       } catch (error) {
+        // Never retry a cancellation, and never let it become a chapter failure.
+        if (isCancellation(error)) throw error;
         lastError = (error as Error).message;
         this.logger.warn(`[Pass 2] Error analyzing chapter ${chapterNumber} (attempt ${attempt + 1}): ${lastError}`);
         if (attempt < maxRetries) {
@@ -1427,6 +1603,7 @@ export class AIAnalysisService {
     customInstructions: string | undefined,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
     onFailure?: (message: string) => void,
+    signal?: AbortSignal,
   ): Promise<ChapterFlag[]> {
     const enabled = categories?.filter((c) => c.enabled !== false) || [];
     if (enabled.length === 0) return [];
@@ -1446,18 +1623,23 @@ export class AIAnalysisService {
     // changes: same model, same temperature, same think level, same prompt.
     const overrides =
       config.provider === 'ollama' && FLAGS_CONSTRAINED
-        ? { format: FLAG_EXTRACTION_SCHEMA }
-        : undefined;
+        ? { format: FLAG_EXTRACTION_SCHEMA, signal }
+        : { signal };
     if (config.provider === 'ollama') {
       this.logger.debug(
         `[Pass 2b] Chapter ${chapterNumber} flag call: ${
-          overrides ? 'schema-constrained (BRIEFCASE_FLAGS_CONSTRAINED=1)' : 'free-running (default)'
+          FLAGS_CONSTRAINED ? 'schema-constrained (BRIEFCASE_FLAGS_CONSTRAINED=1)' : 'free-running (default)'
         }`,
       );
     }
 
     let lastError = '';
     for (let attempt = 0; attempt <= JSON_PARSE_RETRIES; attempt++) {
+      // This function is documented as never throwing — the ONE exception is a
+      // cancellation, which must propagate or the discovery pool would keep
+      // grinding through chapters after the user pressed stop.
+      ensureNotCancelled(signal, `chapter ${chapterNumber} flag extraction`);
+
       try {
         const response = await this.aiProviderService.generateText(prompt, config, 'flags', overrides);
         onTokens?.(response);
@@ -1472,6 +1654,7 @@ export class AIAnalysisService {
           this.logger.warn(`[Pass 2b] No flag response for chapter ${chapterNumber} (attempt ${attempt + 1})`);
         }
       } catch (error) {
+        if (isCancellation(error)) throw error;
         lastError = (error as Error).message;
         this.logger.warn(
           `[Pass 2b] Error extracting flags for chapter ${chapterNumber} (attempt ${attempt + 1}): ${lastError}`,
@@ -1760,6 +1943,7 @@ export class AIAnalysisService {
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
     onFlagProgress?: (current: number, total: number) => void,
     onFlagStatus?: (message: string) => void,
+    signal?: AbortSignal,
   ): Promise<AnalyzedSection[] | null> {
     const sentences = assembleSentences(segments);
     if (sentences.length === 0) {
@@ -1772,9 +1956,18 @@ export class AIAnalysisService {
       onFlagStatus?.(`Ranking ${sentences.length} sentences for flag candidates...`);
       windows = await this.nliRanker.rankWindows(sentences, categories);
     } catch (error) {
+      if (isCancellation(error)) throw error;
+      // Cancelling STOPS the ranker worker, and the in-flight scoring request
+      // then rejects with "worker exited" — which is not a cancellation error
+      // by type but absolutely is one by cause. Returning null here would fall
+      // through to the DISCOVERY path and issue one fresh LLM call per chapter.
+      ensureNotCancelled(signal, 'the NLI ranking stage');
       this.logger.warn(`[Pass 2b] NLI ranking failed: ${(error as Error).message}`);
       return null;
     }
+    // Ranking can take tens of seconds; do not walk into the verification loop
+    // on a run that was cancelled during it.
+    ensureNotCancelled(signal, 'flag verification');
 
     // One call per (window, category) — a passage where three categories fired
     // costs three questions, not one per (sentence, category) pair.
@@ -1845,6 +2038,7 @@ export class AIAnalysisService {
     const overrides = {
       numCtx,
       temperature: 0,
+      signal,
       // Schema on Ollama only — cloud providers ignore overrides entirely and
       // get the same prompt as prose, parsed by parseVerificationVerdict.
       ...(flagConfig.provider === 'ollama' ? { format: FLAG_VERIFICATION_SCHEMA } : {}),
@@ -1869,6 +2063,11 @@ export class AIAnalysisService {
     }
 
     for (let i = 0; i < jobs.length; i++) {
+      // THE big win. This loop is the longest stage in the pipeline (dozens to
+      // hundreds of verification calls on an hour-long video), so aborting the
+      // open call without this check would simply start the next one.
+      ensureNotCancelled(signal, `flag verification ${i + 1}/${jobs.length}`);
+
       const { window, category, passage, prompt } = jobs[i];
       const where = `${this.formatDisplayTime(sentences[window.firedFrom].start)} (${category.category})`;
       const questionHash = this.verificationQuestionHash(
@@ -1947,6 +2146,9 @@ export class AIAnalysisService {
           }
         }
       } catch (error) {
+        // A cancelled call is not a degraded verdict. Counting it as one would
+        // also let the loop continue to the next candidate.
+        if (isCancellation(error)) throw error;
         degraded++;
         this.logger.warn(
           `[Pass 2b] Verification call failed at ${where}: ${(error as Error).message} — not flagged, ` +
@@ -2020,6 +2222,7 @@ export class AIAnalysisService {
     taskModels: Partial<Record<AITaskKind, string>> = {},
     onFlagProgress?: (current: number, total: number) => void,
     onFlagStatus?: (message: string) => void,
+    signal?: AbortSignal,
   ): Promise<{ chapters: Chapter[]; flags: AnalyzedSection[]; warnings?: string[] }> {
     const chapters: Chapter[] = [];
     const warnings: string[] = [];
@@ -2062,6 +2265,9 @@ export class AIAnalysisService {
     }> = [];
 
     for (let i = 0; i < adjustedBoundaries.length; i++) {
+      // Do not start chapter i+1 on a cancelled run.
+      ensureNotCancelled(signal, `chapter ${i + 1}/${adjustedBoundaries.length} analysis`);
+
       const startTime = adjustedBoundaries[i];
       const endTime = i < adjustedBoundaries.length - 1 ? adjustedBoundaries[i + 1] : videoDuration;
 
@@ -2102,8 +2308,13 @@ export class AIAnalysisService {
           previousChapterSummary,
           customInstructions,
           onTokens,
+          signal,
         );
       } catch (error) {
+        // A cancelled chapter is not a FAILED chapter: recording it would
+        // inflate the job's failure count (and could trip TOO_MANY_FAILURES,
+        // turning a user cancel into a reported analysis failure).
+        if (isCancellation(error)) throw error;
         recordFailure(`Pass 2 chapter ${i + 1}/${adjustedBoundaries.length} analysis failed: ${(error as Error).message}`);
         chapters.push({
           sequence: i + 1,
@@ -2172,6 +2383,9 @@ export class AIAnalysisService {
     // Exactly one line of the log says which ran and why.
     // -------------------------------------------------------------------------
     if (pendingFlagWork.length > 0) {
+      // The flag stage is the expensive one. Never enter it on a cancelled run.
+      ensureNotCancelled(signal, 'the flag stage');
+
       let unavailableReason: string | null = FLAGS_DISCOVERY
         ? 'BRIEFCASE_FLAGS_DISCOVERY=1'
         : (await this.nliRanker.isAvailable())
@@ -2190,6 +2404,7 @@ export class AIAnalysisService {
           onTokens,
           onFlagProgress,
           onFlagStatus,
+          signal,
         );
         if (ranked) {
           this.logger.log(
@@ -2247,6 +2462,11 @@ export class AIAnalysisService {
 
       const runWorker = async (): Promise<void> => {
         for (;;) {
+          // Each worker checks independently, so a cancel drains the whole pool
+          // at the next slot boundary rather than only the worker that happened
+          // to hold the aborted call.
+          ensureNotCancelled(signal, 'the next chapter flag extraction');
+
           const slot = nextWorkIndex++;
           if (slot >= pendingFlagWork.length) return;
           const work = pendingFlagWork[slot];
@@ -2262,6 +2482,7 @@ export class AIAnalysisService {
             customInstructions,
             onTokens,
             recordFailure,
+            signal,
           );
           completedFlagChapters++;
           onFlagProgress?.(completedFlagChapters, pendingFlagWork.length);
@@ -2424,6 +2645,7 @@ export class AIAnalysisService {
     config: AIProviderConfig,
     temperature: number | undefined,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
+    signal?: AbortSignal,
   ): Promise<string | null> {
     // Ollama-only lever; cloud providers ignore overrides entirely and simply
     // follow the same prompt's "output JSON only" instruction.
@@ -2432,8 +2654,9 @@ export class AIAnalysisService {
         ? {
             ...(DESCRIPTION_UNCONSTRAINED ? {} : { format: schema }),
             ...(temperature !== undefined ? { temperature } : {}),
+            signal,
           }
-        : undefined;
+        : { signal };
 
     const runOnce = async (prompt: string): Promise<string | null> => {
       const response = await this.aiProviderService.generateText(prompt, config, 'description', overrides);
@@ -2460,6 +2683,8 @@ export class AIAnalysisService {
       this.logger.warn(
         `[Description] ${field}: narrated-actor register detected (${finding.rule}: "${finding.match}") — re-asking once`,
       );
+      // The re-ask is another full generation call — skip it on a cancelled run.
+      ensureNotCancelled(signal, `the ${field} re-ask`);
       const retry = await runOnce(`${basePrompt}\n${REGISTER_RESTATEMENT}`);
       // The second result is ACCEPTED regardless. One re-ask, then we ship what
       // the model wrote; nothing here blocks or rewrites.
@@ -2500,6 +2725,7 @@ export class AIAnalysisService {
     tags: Tags | null,
     recordFailure: (what: string) => void,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
+    signal?: AbortSignal,
   ): Promise<string | null> {
     // Only describe chapters that actually succeeded.
     const validChapters = (chapters || []).filter((ch) => !ch.failed);
@@ -2531,7 +2757,7 @@ export class AIAnalysisService {
       });
       // Hook keeps the 'description' task temperature (0.4) — it needs a little
       // life, which is exactly what that default was chosen for.
-      let hook = await this.generateViewerFacingField('hook', hookPrompt, HOOK_SCHEMA, config, undefined, onTokens);
+      let hook = await this.generateViewerFacingField('hook', hookPrompt, HOOK_SCHEMA, config, undefined, onTokens, signal);
 
       if (hook && hook.length > HOOK_MAX_CHARS) {
         // The ONLY length enforcement — the schema deliberately has no maxLength
@@ -2555,7 +2781,9 @@ export class AIAnalysisService {
           .join('\n')
           .substring(0, 6000),
       });
-      const body = await this.generateViewerFacingField('body', bodyPrompt, BODY_SCHEMA, config, 0.2, onTokens);
+      // The body is a SECOND call. Do not spend it on a cancelled run.
+      ensureNotCancelled(signal, 'the description body call');
+      const body = await this.generateViewerFacingField('body', bodyPrompt, BODY_SCHEMA, config, 0.2, onTokens, signal);
 
       if (!hook && !body) {
         recordFailure('Description generation: neither the hook nor the body call produced text');
@@ -2578,6 +2806,9 @@ export class AIAnalysisService {
       }
       return description;
     } catch (error) {
+      // A cancellation is not a description failure — it must not be recorded
+      // against the job's failure budget.
+      if (isCancellation(error)) throw error;
       recordFailure(`Description generation failed: ${(error as Error).message}`);
       return null;
     }
@@ -2591,6 +2822,7 @@ export class AIAnalysisService {
     chapters: Chapter[],
     recordFailure: (what: string) => void,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
+    signal?: AbortSignal,
   ): Promise<Tags | null> {
     // Only tag chapters that actually succeeded.
     const validChapters = (chapters || []).filter((ch) => !ch.failed);
@@ -2618,8 +2850,8 @@ export class AIAnalysisService {
       // BRIEFCASE_TAGS_UNCONSTRAINED=1 restores free-running decoding.
       const overrides =
         config.provider === 'ollama' && !TAGS_UNCONSTRAINED
-          ? { format: TAGS_EXTRACTION_SCHEMA }
-          : undefined;
+          ? { format: TAGS_EXTRACTION_SCHEMA, signal }
+          : { signal };
 
       const response = await this.aiProviderService.generateText(prompt, config, 'tags', overrides);
       onTokens?.(response);
@@ -2642,6 +2874,7 @@ export class AIAnalysisService {
       recordFailure('Tags extraction returned empty text');
       return null;
     } catch (error) {
+      if (isCancellation(error)) throw error;
       recordFailure(`Tags extraction failed: ${(error as Error).message}`);
       return null;
     }
@@ -2656,6 +2889,7 @@ export class AIAnalysisService {
     currentTitle: string,
     recordFailure: (what: string) => void,
     onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void,
+    signal?: AbortSignal,
   ): Promise<string | null> {
     // Only title from chapters that actually succeeded. A null title is a
     // legitimate "keep the original filename" outcome, so an empty/rejected
@@ -2675,7 +2909,7 @@ export class AIAnalysisService {
         chaptersList: chaptersList.substring(0, 4000),
       });
 
-      const response = await this.aiProviderService.generateText(prompt, config, 'title');
+      const response = await this.aiProviderService.generateText(prompt, config, 'title', { signal });
       onTokens?.(response);
 
       if (response && response.text) {
@@ -2743,6 +2977,7 @@ export class AIAnalysisService {
 
       return null;
     } catch (error) {
+      if (isCancellation(error)) throw error;
       // A hard error (not just a rejected title) is a real failure.
       recordFailure(`Title generation failed: ${(error as Error).message}`);
       return null;
@@ -2757,7 +2992,19 @@ export class AIAnalysisService {
     config: AIProviderConfig,
     pageText: string,
     currentTitle: string,
+    jobId?: string,
   ): Promise<string | null> {
+    // 'analyze-webpage' runs in the same single-slot AI pool as a full
+    // analysis, so it registers the same way — one call, but a cancel must
+    // still abort it and release whatever model it loaded.
+    const controller = new AbortController();
+    const run = { controller, ollamaKeys: new Set<string>() };
+    if (config.provider === 'ollama') {
+      run.ollamaKeys.add(`${config.ollamaEndpoint || 'http://localhost:11434'}::${config.model}`);
+    }
+    const runKey = jobId ?? `standalone-webpage-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    this.activeRuns.set(runKey, run);
+
     try {
       if (!pageText || pageText.trim().length === 0) {
         return null;
@@ -2771,7 +3018,9 @@ export class AIAnalysisService {
         pageText: truncated,
       });
 
-      const response = await this.aiProviderService.generateText(prompt, config, 'title');
+      const response = await this.aiProviderService.generateText(prompt, config, 'title', {
+        signal: controller.signal,
+      });
 
       if (!response || !response.text) {
         return null;
@@ -2826,8 +3075,15 @@ export class AIAnalysisService {
 
       return suggestedTitle || null;
     } catch (error) {
+      // A cancellation must NOT become "no title" — that would let the caller
+      // treat the job as a completed analysis that simply found nothing.
+      if (isCancellation(error)) throw error;
       this.logger.warn(`Webpage title generation failed: ${(error as Error).message}`);
       return null;
+    } finally {
+      if (this.activeRuns.get(runKey) === run) {
+        this.activeRuns.delete(runKey);
+      }
     }
   }
 

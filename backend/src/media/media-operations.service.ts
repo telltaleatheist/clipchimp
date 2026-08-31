@@ -9,6 +9,7 @@ import { FileScannerService } from '../database/file-scanner.service';
 import { DatabaseService } from '../database/database.service';
 import { AIAnalysisService } from '../analysis/ai-analysis.service';
 import { parseProviderModel } from '../analysis/model-utils';
+import { isCancellation } from '../analysis/cancellation';
 import { ApiKeysService } from '../config/api-keys.service';
 import { SharedConfigService } from '../config/shared-config.service';
 import { FfmpegService } from '../ffmpeg/ffmpeg.service';
@@ -570,15 +571,22 @@ export class MediaOperationsService {
         throw new Error('Transcript not found - transcribe video first');
       }
 
-      // Clear existing analysis data before re-running (preserves user markers)
-      const existingAnalysis = this.databaseService.getAnalysis(videoId);
-      if (existingAnalysis) {
-        this.logger.log(`[${jobId || 'standalone'}] Clearing existing analysis for video ${videoId} before re-analyzing`);
-        this.databaseService.deleteAnalysis(videoId);
-        this.databaseService.deleteAITagsForVideo(videoId);
-        this.databaseService.updateVideoDescription(videoId, null);
-        this.databaseService.updateVideoSuggestedTitle(videoId, null);
-      }
+      // NOTE: the existing analysis is NOT cleared here.
+      //
+      // It used to be, and that made a cancel destructive: the clear ran before
+      // the first model call, so pressing stop two seconds into a re-analysis
+      // wiped the analysis row, the AI sections, the AI tags and the
+      // description, and the run that would have replaced them never produced
+      // anything. Same for any failure — a run that died on call one left the
+      // video worse off than not re-analyzing at all.
+      //
+      // The clear now happens right before the results are written (search
+      // for `hadPreviousAnalysis` below), where it is safe: `analyses` has
+      // video_id as its PRIMARY KEY and the insert is INSERT OR REPLACE, and
+      // the save path already deletes AI sections, AI tags and chapters before
+      // re-inserting them. Nothing about the end state of a SUCCESSFUL
+      // re-analysis changes; only the failure and cancel paths do.
+      const hadPreviousAnalysis = !!this.databaseService.getAnalysis(videoId);
 
       this.eventService.emitTaskProgress(jobId || '', 'analyze', 0, 'Starting AI analysis...');
 
@@ -649,7 +657,17 @@ export class MediaOperationsService {
             elapsedMs: progress.elapsedMs,
           });
         },
+        // Threading the job id is what makes this analysis CANCELLABLE:
+        // AIAnalysisService registers the run under it and the queue's
+        // 'job.cancel-requested' for the same id aborts the in-flight
+        // generation, stops every stage loop and releases the models.
+        jobId,
       });
+
+      // EVERY database write in this method is below this await. A cancelled
+      // run throws out of analyzeTranscript rather than returning partial
+      // results, so none of them — analysis row, tags, description, suggested
+      // title, sections, chapters, has_analysis — is ever reached.
 
       // Log analysis result
       this.logger.log(`[${jobId || 'standalone'}] Analysis result:`, JSON.stringify({
@@ -665,6 +683,20 @@ export class MediaOperationsService {
 
       // Read analysis file
       const analysisText = fs.readFileSync(analysisOutputPath, 'utf8');
+
+      // Now — and only now, with real results in hand — retire the previous
+      // analysis. Description and suggested title are nulled here rather than
+      // relying on the writes below, because a run that legitimately produces
+      // neither must not leave the OLD ones sitting under a new analysis.
+      // User-created markers are preserved (deleteAnalysis only removes
+      // source='ai' sections).
+      if (hadPreviousAnalysis) {
+        this.logger.log(`[${jobId || 'standalone'}] Replacing the previous analysis for video ${videoId}`);
+        this.databaseService.deleteAnalysis(videoId);
+        this.databaseService.deleteAITagsForVideo(videoId);
+        this.databaseService.updateVideoDescription(videoId, null);
+        this.databaseService.updateVideoSuggestedTitle(videoId, null);
+      }
 
       // Save analysis to database (including title suggestion in summary field)
       this.databaseService.insertAnalysis({
@@ -801,6 +833,18 @@ export class MediaOperationsService {
         warnings: analysisResult.warnings,
       };
     } catch (error) {
+      // A user cancellation is not an analysis failure. It reaches here after
+      // the pipeline unwound WITHOUT persisting anything (every write above is
+      // downstream of the analyzeTranscript await), so all that is left is to
+      // report it honestly: log level, not error level, and a result the queue
+      // recognises. QueueManagerService.executeTask checks isJobCancelled
+      // before it inspects `success`, so this never emits task.failed.
+      if (isCancellation(error)) {
+        this.logger.log(
+          `[${jobId || 'standalone'}] Analysis cancelled for video ${videoId} — nothing was saved`,
+        );
+        return { success: false, error: 'Analysis cancelled' };
+      }
       this.logger.error(`Analysis failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       return {
         success: false,
@@ -901,9 +945,10 @@ export class MediaOperationsService {
         }
       }
 
-      // Clear previous suggested title so the UI shows the new one
-      this.databaseService.updateVideoSuggestedTitle(videoId, null);
-
+      // The previous suggested title is NOT cleared here — same reasoning as
+      // analyzeVideo: clearing before the call means a cancelled or failed run
+      // destroys the old title and puts nothing in its place. It is cleared
+      // below, once the call has actually returned.
       this.eventService.emitTaskProgress(jobId || '', 'analyze', 30, 'Generating title with AI...');
 
       const currentTitle = video.filename.replace(/\.[^/.]+$/, '');
@@ -917,12 +962,17 @@ export class MediaOperationsService {
         },
         textContent.extracted_text,
         currentTitle,
+        // Makes this cancellable — see generateTitleFromWebpageText.
+        jobId,
       );
 
       if (suggestedTitle) {
         this.databaseService.updateVideoSuggestedTitle(videoId, suggestedTitle);
         this.logger.log(`[${jobId || 'standalone'}] Saved suggested title for webpage: ${suggestedTitle}`);
       } else {
+        // The model answered but the answer was rejected. That IS a result:
+        // retire the stale title rather than leaving the old one in place.
+        this.databaseService.updateVideoSuggestedTitle(videoId, null);
         this.logger.warn(`[${jobId || 'standalone'}] AI did not return a valid title for webpage ${videoId}`);
       }
 
@@ -936,6 +986,12 @@ export class MediaOperationsService {
         },
       };
     } catch (error) {
+      if (isCancellation(error)) {
+        this.logger.log(
+          `[${jobId || 'standalone'}] Webpage analysis cancelled for ${videoId} — nothing was saved`,
+        );
+        return { success: false, error: 'Analysis cancelled' };
+      }
       this.logger.error(`Webpage analysis failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       return {
         success: false,

@@ -43,6 +43,7 @@ import { AIProviderService, AIProviderConfig } from './ai-provider.service';
 import { estimateNumCtx } from './model-utils';
 import { findPhraseTimestamp, TranscriptSegment } from './phrase-matcher';
 import { safeJsonParse } from './json-utils';
+import { ensureNotCancelled, isCancellation } from './cancellation';
 import { buildBoundaryPlacementPrompt } from './prompts/analysis-prompts';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -130,6 +131,12 @@ export interface ChapterDetectionOptions {
   onTokens?: (response: { inputTokens?: number; outputTokens?: number; estimatedCost?: number }) => void;
   /** Called with (current, total, message) so the caller can drive its own band. */
   onProgress?: (current: number, total: number, label: string) => void;
+  /**
+   * Cancellation for the whole run. Pass 1 is a LOOP of placement calls, so
+   * aborting the open call is not enough — the loop checks this before each
+   * iteration and throws AnalysisCancelledError rather than starting call N+1.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ChapterDetectionResult {
@@ -348,7 +355,7 @@ export class ChapterDetectionService {
 
     // ---- stages 1-2: stretch and score --------------------------------------
     const scoreStart = Date.now();
-    let vectors = await this.embedStretches(stretches, options.ollamaEndpoint);
+    let vectors = await this.embedStretches(stretches, options.ollamaEndpoint, options.signal);
     const scorer: 'embedding' | 'lexical' = vectors ? 'embedding' : 'lexical';
     if (!vectors) vectors = lexicalVectors(stretches);
 
@@ -407,6 +414,7 @@ export class ChapterDetectionService {
   private async embedStretches(
     stretches: Stretch[],
     ollamaEndpoint?: string,
+    signal?: AbortSignal,
   ): Promise<number[][] | null> {
     const endpoint = ollamaEndpoint || 'http://localhost:11434';
     const model = this.resolveEmbeddingModel();
@@ -417,6 +425,9 @@ export class ChapterDetectionService {
     // abort, so a wedged Ollama cannot hang the pass.
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), EMBED_TIMEOUT_MS);
+    // A cancelled job must not sit out the 60s embed timeout before unwinding.
+    const onCancel = () => controller.abort();
+    signal?.addEventListener('abort', onCancel, { once: true });
     const started = Date.now();
 
     try {
@@ -454,6 +465,9 @@ export class ChapterDetectionService {
       );
       return embeddings as number[][];
     } catch (error) {
+      // Cancelling is not "embeddings unavailable" — degrading to the lexical
+      // scorer here would carry a cancelled run on into Pass 1 placement.
+      ensureNotCancelled(signal, 'the embedding scorer');
       this.logger.warn(
         `[Pass 1] Embedding scorer unavailable (${(error as Error).message}) — ` +
         `falling back to the LEXICAL scorer. Boundaries will be weaker: it matches ` +
@@ -462,6 +476,7 @@ export class ChapterDetectionService {
       return null;
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener('abort', onCancel);
     }
   }
 
@@ -518,7 +533,7 @@ export class ChapterDetectionService {
     options: ChapterDetectionOptions,
     totalTicks: number,
   ): Promise<{ times: number[]; calls: number; unplaced: number }> {
-    const { boundaryConfig, videoTitle, onTokens, onProgress } = options;
+    const { boundaryConfig, videoTitle, onTokens, onProgress, signal } = options;
     const times: number[] = [];
     let calls = 0;
     let unplaced = 0;
@@ -535,6 +550,10 @@ export class ChapterDetectionService {
     const numCtx = estimateNumCtx(largestPrompt, boundaryConfig.model, PLACE_OUTPUT_BUDGET_TOKENS);
 
     for (let i = 0; i < chosen.length; i++) {
+      // Refuse to start the next placement call on a cancelled run. Without
+      // this the loop would abort call i and immediately issue call i+1.
+      ensureNotCancelled(signal, `boundary placement ${i + 1}/${chosen.length}`);
+
       const junction = chosen[i];
       const before = stretches[junction.index];
       const after = stretches[junction.index + 1];
@@ -549,7 +568,7 @@ export class ChapterDetectionService {
           'boundary',
           // format:'json' constrains the answer to the object we asked for; the
           // fixed num_ctx keeps the runner loaded across the whole stage.
-          { numCtx, format: 'json' },
+          { numCtx, format: 'json', signal },
         );
         onTokens?.(response);
 
@@ -585,6 +604,10 @@ export class ChapterDetectionService {
           `"${quote.substring(0, 60)}"`,
         );
       } catch (error) {
+        // A cancelled call is NOT a placement degradation. This catch exists to
+        // keep a bad quote from failing the run; swallowing a cancellation here
+        // would let the loop continue straight into the next call.
+        if (isCancellation(error)) throw error;
         this.logger.warn(
           `[Pass 1] Placement failed at ${formatDisplayTime(junction.time)} ` +
           `(${(error as Error).message}) — keeping the junction time (45s resolution)`,

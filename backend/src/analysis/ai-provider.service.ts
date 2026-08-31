@@ -10,6 +10,7 @@ import {
   stripThinkTags,
 } from './model-utils';
 import { negotiateOllamaThink, markGradedThinkUnsupported } from './ollama-capabilities';
+import { AnalysisCancelledError, ensureNotCancelled } from './cancellation';
 
 export interface AIProviderConfig {
   provider: 'local' | 'ollama' | 'claude' | 'openai';
@@ -73,6 +74,17 @@ export interface AIGenerateOverrides {
    * ignored there — same as `format`.
    */
   temperature?: number;
+  /**
+   * Cancellation for THIS call, owned by the caller (one signal per analysis
+   * job — see ai-analysis.service's run registry).
+   *
+   * Unlike `numCtx`/`format`/`temperature`, this is honored by EVERY provider:
+   * cancelling a job has to stop a Claude or OpenAI generation just as hard as
+   * an Ollama one. When it fires, the call rejects with AnalysisCancelledError
+   * rather than a provider error, so no catch block upstream mistakes a
+   * cancellation for a failure worth retrying, recording, or degrading around.
+   */
+  signal?: AbortSignal;
 }
 
 @Injectable()
@@ -181,6 +193,10 @@ export class AIProviderService {
     task?: AITaskKind,
     overrides?: AIGenerateOverrides,
   ): Promise<AIResponse> {
+    // Last gate before a request is ISSUED. Aborting the open call is only half
+    // a cancellation; the other half is never starting the next one.
+    ensureNotCancelled(overrides?.signal, `a ${task ?? 'generation'} call`);
+
     this.logger.log(`Generating text with provider: ${config.provider}, model: ${config.model}, task: ${task ?? 'unspecified'}`);
 
     // Per-task default, unless this particular call asked for its own.
@@ -188,13 +204,13 @@ export class AIProviderService {
 
     switch (config.provider) {
       case 'local':
-        return this.generateWithLocal(prompt, temperature);
+        return this.generateWithLocal(prompt, temperature, overrides?.signal);
       case 'claude':
         // Cloud providers get NO sampling params (see generateWithClaude).
-        return this.generateWithClaude(prompt, config);
+        return this.generateWithClaude(prompt, config, overrides?.signal);
       case 'openai':
         // Cloud providers get NO sampling params (see generateWithOpenAI).
-        return this.generateWithOpenAI(prompt, config);
+        return this.generateWithOpenAI(prompt, config, overrides?.signal);
       case 'ollama':
         return this.generateWithOllama(prompt, config, temperature, task, overrides);
       default:
@@ -217,6 +233,7 @@ export class AIProviderService {
   private async generateWithClaude(
     prompt: string,
     config: AIProviderConfig,
+    signal?: AbortSignal,
   ): Promise<AIResponse> {
     if (!config.apiKey) {
       throw new Error('Claude API key is required');
@@ -230,17 +247,23 @@ export class AIProviderService {
     }
 
     try {
-      const message = await this.anthropic.messages.create({
-        model: config.model,
-        max_tokens: 4096,
-        // No temperature / top_p / top_k — removed on newer Claude models (400).
-        messages: [
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
-      });
+      const message = await this.anthropic.messages.create(
+        {
+          model: config.model,
+          max_tokens: 4096,
+          // No temperature / top_p / top_k — removed on newer Claude models (400).
+          messages: [
+            {
+              role: 'user',
+              content: prompt,
+            },
+          ],
+        },
+        // Request option, NOT a body field: the SDK forwards it to fetch, so a
+        // cancelled job tears the HTTP request down instead of paying for a
+        // generation nobody will read.
+        { signal },
+      );
 
       const textContent = message.content.find((block) => block.type === 'text');
       const text = stripThinkTags(textContent && 'text' in textContent ? textContent.text : '');
@@ -263,6 +286,11 @@ export class AIProviderService {
         model: config.model,
       };
     } catch (error) {
+      // A cancelled job is not a Claude fault — surface it as a cancellation so
+      // no upstream retry/failure-accounting path treats it as one.
+      if (signal?.aborted) {
+        throw new AnalysisCancelledError('Claude request cancelled: job was cancelled');
+      }
       this.logger.error(`Claude API error: ${(error as Error).message}`);
       throw new Error(`Claude API error: ${(error as Error).message}`);
     }
@@ -278,6 +306,7 @@ export class AIProviderService {
   private async generateWithOpenAI(
     prompt: string,
     config: AIProviderConfig,
+    signal?: AbortSignal,
   ): Promise<AIResponse> {
     if (!config.apiKey) {
       throw new Error('OpenAI API key is required');
@@ -296,17 +325,22 @@ export class AIProviderService {
     const isReasoningModel = /^o\d/.test(config.model);
 
     try {
-      const completion = await this.openai.chat.completions.create({
-        model: config.model,
-        messages: [
-          {
-            role: 'user',
-            content: prompt,
-          },
-        ],
-        ...(isReasoningModel ? { max_completion_tokens: 4096 } : { max_tokens: 4096 }),
-        // No temperature — omitted for all cloud providers.
-      });
+      const completion = await this.openai.chat.completions.create(
+        {
+          model: config.model,
+          messages: [
+            {
+              role: 'user',
+              content: prompt,
+            },
+          ],
+          ...(isReasoningModel ? { max_completion_tokens: 4096 } : { max_tokens: 4096 }),
+          // No temperature — omitted for all cloud providers.
+        },
+        // Request option (see the Claude path): cancellation tears down the HTTP
+        // request rather than waiting out a generation nobody will read.
+        { signal },
+      );
 
       const text = stripThinkTags(completion.choices[0]?.message?.content || '');
 
@@ -329,6 +363,9 @@ export class AIProviderService {
         model: config.model,
       };
     } catch (error) {
+      if (signal?.aborted) {
+        throw new AnalysisCancelledError('OpenAI request cancelled: job was cancelled');
+      }
       this.logger.error(`OpenAI API error: ${(error as Error).message}`);
       throw new Error(`OpenAI API error: ${(error as Error).message}`);
     }
@@ -388,6 +425,14 @@ export class AIProviderService {
     const controller = new AbortController();
     const timeoutHandle = setTimeout(() => controller.abort(), 600000);
     this.inFlightOllama.add(controller);
+
+    // Job cancellation reuses that same controller rather than racing a second
+    // signal: the fetch already honours it, and Ollama cancels the runner's
+    // generation when the client disconnects — which is what makes the model
+    // free within a second instead of finishing the answer first.
+    const jobSignal = overrides?.signal;
+    const onJobCancelled = () => controller.abort();
+    jobSignal?.addEventListener('abort', onJobCancelled, { once: true });
 
     try {
       const post = (fields: Record<string, unknown>) =>
@@ -486,11 +531,19 @@ export class AIProviderService {
       if (this.releasingOllama) {
         throw new Error('Ollama request cancelled: application is shutting down');
       }
+      // Likewise a job the user cancelled. Checked BEFORE the generic handler
+      // because the abort surfaces here as an ordinary fetch AbortError, which
+      // is indistinguishable from the 10-minute timeout's abort by message —
+      // and the timeout genuinely IS a failure.
+      if (jobSignal?.aborted) {
+        throw new AnalysisCancelledError('Ollama request cancelled: job was cancelled');
+      }
       this.logger.error(`Ollama API error: ${(error as Error).message}`);
       throw new Error(`Ollama API error: ${(error as Error).message}`);
     } finally {
       clearTimeout(timeoutHandle);
       this.inFlightOllama.delete(controller);
+      jobSignal?.removeEventListener('abort', onJobCancelled);
     }
   }
 
@@ -519,8 +572,42 @@ export class AIProviderService {
     const targets = [...this.ollamaModelsInUse];
     this.ollamaModelsInUse.clear();
 
+    // Must fit inside the parent's shutdown grace period.
+    await this.unloadOllamaKeys(targets, 'Shutdown', 2000);
+  }
+
+  /**
+   * Release a SPECIFIC set of `${endpoint}::${model}` keys — the models one
+   * cancelled job loaded — without touching anything else.
+   *
+   * This is the cancel-time counterpart to `releaseOllamaModels`, and it is
+   * deliberately narrower in two directions:
+   *
+   *  - it never unloads a model this app did not load (the intersection with
+   *    `ollamaModelsInUse`), because the Ollama daemon is shared with another
+   *    app on this machine and a blanket unload would evict its models; and
+   *  - it does not set `releasingOllama` and does not abort in-flight calls,
+   *    because OTHER work may legitimately still be running. The caller aborts
+   *    exactly its own job's calls first, and passes only the keys no other
+   *    live run still needs.
+   *
+   * Never throws.
+   */
+  async releaseOllamaModelKeys(keys: Iterable<string>): Promise<void> {
+    const targets = [...new Set(keys)].filter((key) => this.ollamaModelsInUse.has(key));
+    if (targets.length === 0) return;
+    for (const key of targets) this.ollamaModelsInUse.delete(key);
+
+    // A cancel has no shutdown deadline to beat, but the aborted generation
+    // must have actually let go of the model before the unload is served, so
+    // give it more room than the 2s shutdown budget.
+    await this.unloadOllamaKeys(targets, 'Cancel', 5000);
+  }
+
+  /** `keep_alive: 0` with no prompt — Ollama's unload request. Never throws. */
+  private async unloadOllamaKeys(keys: string[], context: string, timeoutMs: number): Promise<void> {
     await Promise.all(
-      targets.map(async (key) => {
+      keys.map(async (key) => {
         const sep = key.indexOf('::');
         const endpoint = key.slice(0, sep);
         const model = key.slice(sep + 2);
@@ -528,13 +615,12 @@ export class AIProviderService {
           await fetch(`${endpoint}/api/generate`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            // Must fit inside the parent's shutdown grace period.
-            signal: AbortSignal.timeout(2000),
+            signal: AbortSignal.timeout(timeoutMs),
             body: JSON.stringify({ model, keep_alive: 0 }),
           });
-          this.logger.log(`[Shutdown] Released Ollama model: ${model}`);
+          this.logger.log(`[${context}] Released Ollama model: ${model}`);
         } catch (error) {
-          this.logger.warn(`[Shutdown] Could not release ${model}: ${(error as Error).message}`);
+          this.logger.warn(`[${context}] Could not release ${model}: ${(error as Error).message}`);
         }
       }),
     );
@@ -543,13 +629,17 @@ export class AIProviderService {
   /**
    * Generate text using bundled local AI (Cogito 8B via llama.cpp)
    */
-  private async generateWithLocal(prompt: string, temperature: number): Promise<AIResponse> {
+  private async generateWithLocal(
+    prompt: string,
+    temperature: number,
+    signal?: AbortSignal,
+  ): Promise<AIResponse> {
     if (!this.llamaManager.isAvailable()) {
       throw new Error('Local AI model not available. Please reinstall the application.');
     }
 
     try {
-      const result = await this.llamaManager.generateText(prompt, { temperature });
+      const result = await this.llamaManager.generateText(prompt, { temperature, signal });
 
       this.logger.log(
         `Local AI tokens: ${result.inputTokens} input + ${result.outputTokens} output = ${result.totalTokens} total (local, $0.00)`,
@@ -565,6 +655,9 @@ export class AIProviderService {
         model: result.model,
       };
     } catch (error) {
+      if (signal?.aborted) {
+        throw new AnalysisCancelledError('Local AI request cancelled: job was cancelled');
+      }
       this.logger.error(`Local AI error: ${(error as Error).message}`);
       throw new Error(`Local AI error: ${(error as Error).message}`);
     }
